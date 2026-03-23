@@ -1,0 +1,49 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: inject-s3-sidecar
+spec:
+  rules:
+    - name: inject-sidecar
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              annotations:
+                s3.csi.aws.com/sidecar: "true"
+      preconditions:
+        all:
+          - key: mountpoint-s3-sidecar
+            operator: AnyNotIn
+            value: "{{ request.object.spec.initContainers[].name || `[]` }}"
+      mutate:
+        patchStrategicMerge:
+          spec:
+            volumes:
+              - name: comm
+                emptyDir:
+                  medium: ""
+            initContainers:
+              - name: mountpoint-s3-sidecar
+                image: <>.dkr.ecr.us-west-2.amazonaws.com/s3-csi-driver:sidecar-mounter-2
+                command: ["/bin/aws-s3-csi-mounter"]
+                # image: busybox:latest
+                # command: ["sleep", "3600"]
+                restartPolicy: Always
+                env: "{{ request.object.spec.containers[0].env || `[]` }}"
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop: ["ALL"]
+                  runAsNonRoot: true
+                  runAsUser: 1000
+                volumeMounts:
+                  - name: comm
+                    # this may be useful for crash recovery
+                    # mountPropagation: HostToContainer
+                    mountPath: /comm
+                  # todo: this has to be conditional: only if mounted to the main container
+                  - name: aws-iam-token
+                    readOnly: true
+                    mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount

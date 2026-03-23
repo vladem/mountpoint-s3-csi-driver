@@ -94,6 +94,10 @@ spec:
               value: {{ .Values.mountpointPod.namespace }}
             - name: EKS_POD_IDENTITY_AGENT_CONTAINER_CREDENTIALS_FULL_URI
               value: {{ .Values.eksPodIdentityAgent.containerCredentialsFullURI }}
+            {{- if .Values.mounterKind }}
+            - name: MOUNTER_KIND
+              value: {{ .Values.mounterKind | quote }}
+            {{- end }}
             {{- with .Values.awsAccessSecret }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:

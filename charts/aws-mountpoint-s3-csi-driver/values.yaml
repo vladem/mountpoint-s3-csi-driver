@@ -14,6 +14,15 @@ image:
   # Overrides the image tag whose default is the chart appVersion.
   tag: "v2.4.1"
 
+# Mounter kind to use for mounting S3 buckets.
+# Supported values:
+#   "" (empty/default) - PodMounter: uses dedicated Mountpoint Pods managed by the controller.
+#   "sidecar"          - SidecarMounter: the Mountpoint process runs as a sidecar container
+#                        in the workload pod. Communication happens via an emptyDir volume.
+#                        No separate Mountpoint Pod, CRD, or credential provisioning is needed —
+#                        the ServiceAccount on the workload pod determines S3 permissions.
+mounterKind: "sidecar"
+
 node:
   kubeletPath: /var/lib/kubelet
   logLevel: 4
@@ -87,8 +96,10 @@ controller:
   #   kubernetes.io/role: control-plane
   serviceAccount:
     # Specifies whether a service account should be created
-    create: true
+    create: false
     name: s3-csi-driver-controller-sa
+
+node.serviceAccount.create: false
 
 mountpointPod:
   namespace: mount-s3

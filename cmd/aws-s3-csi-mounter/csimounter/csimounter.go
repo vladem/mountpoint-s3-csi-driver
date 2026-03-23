@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"k8s.io/klog/v2"
 
@@ -51,12 +52,14 @@ func Run(options Options) (int, error) {
 		mountpointArgs.Set(mountpoint.ArgCache, localCacheDir)
 	}
 
+	env := mergeEnv(os.Environ(), mountOptions.Env)
+
 	exitCode, stdErr, err := runner.RunInForeground(runner.ForegroundOptions{
 		BinaryPath: options.MountpointPath,
 		BucketName: mountOptions.BucketName,
 		Fd:         mountOptions.Fd,
 		Args:       mountpointArgs,
-		Env:        mountOptions.Env,
+		Env:        env,
 		CmdRunner:  options.CmdRunner,
 	})
 	if err != nil {
@@ -94,4 +97,33 @@ func checkIfDirExists(path string) bool {
 		return false
 	}
 	return stat.IsDir()
+}
+
+// mergeEnv merges base environment variables with overrides.
+// Each entry is in "KEY=VALUE" format. Entries in overrides take precedence over base.
+func mergeEnv(base, overrides []string) []string {
+	env := make(map[string]string, len(base)+len(overrides))
+	// Maintain insertion order by tracking keys.
+	keys := make([]string, 0, len(base)+len(overrides))
+
+	for _, entry := range base {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, exists := env[key]; !exists {
+			keys = append(keys, key)
+		}
+		env[key] = entry
+	}
+	for _, entry := range overrides {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, exists := env[key]; !exists {
+			keys = append(keys, key)
+		}
+		env[key] = entry
+	}
+
+	result := make([]string, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, env[key])
+	}
+	return result
 }
