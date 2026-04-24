@@ -26,6 +26,8 @@ node:
     # Specifies whether a service account should be created
     create: true
     name: s3-csi-driver-sa
+    # In daemonset mode, this SA is used only for Kubernetes API access (e.g. listing pods).
+    # S3 access for driver-level credentials moves to the mounter SA (daemonsetMounters[].serviceAccount).
     # Specify the CSI Driver SA's role ARN if want to use driver-level IRSA,
     # see https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/CONFIGURATION.md#aws-credentials for more details.
     # annotations:
@@ -80,6 +82,8 @@ sidecars:
         name: plugin-dir
     resources: {}
 
+# In daemonset mode, the controller only manages existing V2 mounts (cleanup, credential refresh)
+# and does not spawn new Mountpoint Pods. New mounts go through the mounter DaemonSet.
 controller:
   # Consider deploying the controller component to special nodes for controller components.
   # See https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/INSTALL.md#configuring-nodeSelector-for-the-controller-component for more details.
@@ -92,16 +96,105 @@ controller:
     create: true
     name: s3-csi-driver-controller-sa
 
+# In daemonset mode new mounts do not use Mountpoint Pods.
 mountpointPod:
   namespace: mount-s3
   # If creating the namespace yourself, review the namespace definition in this Helm chart to follow the best practices.
   # For example, this chart enforces that pods in the namespace are bound by the 'restricted' pod security standard.
-  # This allows us to restrict the pods that the driver's node daemon has privileges to create.
+  # This allows us to restrict the pods that the driver's node daemon has privileges to create.
   createNamespace: true
   priorityClassName: mount-s3-critical
   preemptingPriorityClassName: mount-s3-preempting-critical
   headroomPriorityClassName: mount-s3-headroom
   podLabels: {}
+
+# Daemonset mode: run all Mountpoint processes on a node inside a single pre-placed DaemonSet pod.
+# Eliminates scheduling failures caused by pod-count limits and resource exhaustion.
+# Set daemonsetMode to true to enable. Pod-mode sections (controller, mountpointPod, experimental)
+# are only used to maintain existing mounts when daemonset mode is enabled.
+# Use daemonsetMounters to customize the mounter DaemonSet. If omitted or empty, defaults apply
+# (maxMountsPerNode: 10, memory: 2Gi, no cache).
+# Only a single daemonsetMounters entry is supported currently. Multiple entries for heterogeneous
+# node configurations will be supported in a future release.
+#
+# Simplest enable (uses defaults):
+#   helm install ... --set daemonsetMode=true
+#
+# Custom config:
+#   daemonsetMode: true
+#   daemonsetMounters:
+#     - maxMountsPerNode: 10
+#       resources:
+#         requests:
+#           memory: "20Gi"
+#           cpu: "500m"
+#       cache:
+#         emptyDir: {}
+#
+# See docs/DAEMONSET_MODE.md for sizing guidance, upgrade procedure, and limitations.
+daemonsetMode: false
+daemonsetMounters: []
+#
+#   # --- Volume limits ---
+#   # Maximum number of distinct S3 volumes (Mountpoint processes) per node.
+#   # Advertised to the Kubernetes scheduler via MaxVolumesPerNode.
+#   # Shared volumes (same PV used by multiple pods) are counted once.
+#   # Default: 10.
+#   # maxMountsPerNode: 10
+#
+#   # --- Mounter pod resources ---
+#   # Resource requests and limits for the mounter DaemonSet pod.
+#   # requests.memory should be sized to maxMountsPerNode × per-mount memory
+#   # (e.g., 10 mounts × 2Gi = 20Gi).
+#   # Default: memory: "2Gi".
+#   # resources:
+#   #   requests:
+#   #     memory: "20Gi"
+#   #     cpu: "500m"
+#   #   # Optional hard limits. Use with caution:
+#   #   # - memory limit: OOM kill terminates ALL mounts on the node.
+#   #   # - cpu limit: throttles ALL mounts on the node collectively.
+#   #   # limits:
+#   #   #   memory: "24Gi"
+#   #   #   cpu: "1"
+#
+#   # --- Cache ---
+#   # Shared cache for all Mountpoint processes on the node.
+#   # Each mount gets a dedicated subdirectory (/cache/<vol-id>/).
+#   # Per-PV cache settings (--cache, --max-cache-size via volumeAttributes)
+#   # remain configurable — but the underlying storage is shared.
+#   # Omit to disable cache entirely.
+#   # Presence of emptyDir or ephemeral key selects the cache volume type.
+#   # cache:
+#   #   emptyDir:
+#   #     ephemeralStorageRequest: "100Gi"  # Scheduler reservation for cache disk on the node's root volume.
+#   #                                      # See https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#setting-requests-and-limits-for-local-ephemeral-storage
+#   #     # sizeLimit: "100Gi"  # Optional. WARNING: exceeding sizeLimit triggers kubelet eviction
+#   #     #                     # of the mounter pod, killing ALL mounts on the node.
+#   #   # Alternative — ephemeral volume backed by a StorageClass (e.g. instance store, EBS):
+#   #   # ephemeral:
+#   #   #   storageClassName: gp2
+#   #   #   storageRequest: "100Gi"
+#
+#   # --- Scheduling ---
+#   # Defaults to the corresponding node.* values if not set.
+#   # Override only if the mounter DaemonSet needs different scheduling than the CSI node plugin.
+#   # nodeSelector: {}
+#   # tolerations: []
+#   # affinity: {}
+#
+#   # --- Metadata ---
+#   # podLabels: {}
+#
+#   # --- Service account ---
+#   # In daemonset mode, the node SA (node.serviceAccount) is used only for Kubernetes API
+#   # access (e.g. listing pods), while the mounter SA below is used for S3 access
+#   # when using driver-level credentials (IRSA / EKS Pod Identity).
+#   # serviceAccount:
+#   #   create: true
+#   #   name: s3-csi-mounter-sa
+#   #   annotations:
+#   #     eks.amazonaws.com/role-arn: ""
 
 nameOverride: ""
 fullnameOverride: ""
@@ -110,6 +203,8 @@ customLabels: {}
 
 imagePullSecrets: []
 
+# AWS credentials from a Kubernetes Secret, provided as environment variables to the CSI node plugin
+# and, in daemonset mode, also to Mountpoint processes in the mounter DaemonSet pod.
 awsAccessSecret:
   name: aws-secret
   keyId: key_id
@@ -129,6 +224,8 @@ eksPodIdentityAgent:
 # TODO: Remove this in v3 as systemd mount support will be discontinued
 supportLegacySystemDMounts: true
 
+# In daemonset mode new mounts do not use Mountpoint Pods.
+# Experimental features for the pod-based Mountpoint architecture.
 experimental:
   # Enables support for `s3.csi.aws.com/reserve-headroom-for-mppod` scheduling gate on the Workload Pods.
   # See https://github.com/awslabs/mountpoint-s3-csi-driver/blob/main/docs/HEADROOM_FOR_MPPOD.md for more details.
