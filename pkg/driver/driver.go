@@ -117,28 +117,37 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 
 	stopCh := make(chan struct{})
 
-	mpMounter := mpmounter.New()
-	podWatcher := watcher.New(clientset, mountpointPodNamespace, nodeID, podWatcherResyncPeriod)
-	err = podWatcher.Start(stopCh)
-	if err != nil {
-		klog.Fatalf("Failed to start Pod watcher: %v\n", err)
+	var nodeMounter mounter.Mounter
+
+	if mounterMode := os.Getenv("MOUNTER_MODE"); mounterMode == "daemonset" {
+		klog.Infof("Using daemonset mounter mode")
+		nodeMounter = mounter.NewDaemonsetMounter(clientset, nodeID)
+		// TODO: later we'll need to handle unmounts of V2 pods (podWatcher, unmounter, etc)
+	} else {
+		mpMounter := mpmounter.New()
+		podWatcher := watcher.New(clientset, mountpointPodNamespace, nodeID, podWatcherResyncPeriod)
+		err = podWatcher.Start(stopCh)
+		if err != nil {
+			klog.Fatalf("Failed to start Pod watcher: %v\n", err)
+		}
+
+		s3paCache := setupS3PodAttachmentCache(config, stopCh, nodeID, kubernetesVersion)
+
+		unmounter := mounter.NewPodUnmounter(nodeID, mpMounter, podWatcher, credProvider)
+
+		podWatcher.AddEventHandler(cache.ResourceEventHandlerFuncs{UpdateFunc: unmounter.HandleMountpointPodUpdate})
+
+		go unmounter.StartPeriodicCleanup(stopCh)
+
+		podMounter, err := mounter.NewPodMounter(podWatcher, s3paCache, credProvider, mpMounter, nil, nil,
+			kubernetesVersion, nodeID, variant)
+		if err != nil {
+			klog.Fatalln(err)
+		}
+		nodeMounter = podMounter
 	}
 
-	s3paCache := setupS3PodAttachmentCache(config, stopCh, nodeID, kubernetesVersion)
-
-	unmounter := mounter.NewPodUnmounter(nodeID, mpMounter, podWatcher, credProvider)
-
-	podWatcher.AddEventHandler(cache.ResourceEventHandlerFuncs{UpdateFunc: unmounter.HandleMountpointPodUpdate})
-
-	go unmounter.StartPeriodicCleanup(stopCh)
-
-	podMounter, err := mounter.NewPodMounter(podWatcher, s3paCache, credProvider, mpMounter, nil, nil,
-		kubernetesVersion, nodeID, variant)
-	if err != nil {
-		klog.Fatalln(err)
-	}
-
-	nodeServer := node.NewS3NodeServer(nodeID, podMounter)
+	nodeServer := node.NewS3NodeServer(nodeID, nodeMounter)
 
 	return &Driver{
 		Endpoint:   endpoint,

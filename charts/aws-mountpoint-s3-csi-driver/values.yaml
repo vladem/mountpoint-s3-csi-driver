@@ -5,6 +5,9 @@
 # If not set, auto-detects OpenShift where possible.
 isOpenShift: null
 
+# Mounter mode: "pod" (V2 default, one pod per mount) or "daemonset" (all mounts in one pod per node)
+mounterMode: "pod"
+
 image:
   # Our regional ECR repositories are labelled `eks/aws-s3-csi-driver`.
   # See https://docs.aws.amazon.com/eks/latest/userguide/add-ons-images.html for the per-region registry list.
@@ -135,3 +138,17 @@ experimental:
   reserveHeadroomForMountpointPods: false
   headroomPodImage: public.ecr.aws/eks-distro/kubernetes/pause:3.10
   headroomPodLabels: {}
+
+# Configuration for the secondary (mounter) daemonset.
+# Only used when mounterMode is "daemonset".
+mounterDaemonset:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 256Mi
+  podLabels: {}
+  nodeSelector: {}
+  tolerateAllTaints: true
+  tolerations: []

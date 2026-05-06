@@ -1,0 +1,74 @@
+{{- if eq .Values.mounterMode "daemonset" }}
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: s3-csi-mounter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aws-mountpoint-s3-csi-driver.labels" . | nindent 4 }}
+spec:
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: s3-csi-mounter
+      {{- include "aws-mountpoint-s3-csi-driver.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        app: s3-csi-mounter
+        {{- include "aws-mountpoint-s3-csi-driver.labels" . | nindent 8 }}
+        {{- if .Values.mounterDaemonset.podLabels }}
+        {{- toYaml .Values.mounterDaemonset.podLabels | nindent 8 }}
+        {{- end }}
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+        {{- with .Values.mounterDaemonset.nodeSelector }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      serviceAccountName: {{ .Values.node.serviceAccount.name }}
+      priorityClassName: system-node-critical
+      {{- with .Values.node.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        {{- if .Values.mounterDaemonset.tolerateAllTaints }}
+        - operator: Exists
+        {{- end }}
+        {{- with .Values.mounterDaemonset.tolerations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if .Values.imagePullSecrets }}
+      imagePullSecrets:
+      {{- range .Values.imagePullSecrets }}
+        - name: {{ . }}
+      {{- end }}
+      {{- end }}
+      containers:
+        - name: mounter
+          image: {{ include "csiDriverImageName" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/aws-s3-csi-daemonset-mounter
+          args:
+            - --comm-dir=/comm
+            - --mountpoint-bin-dir=$(MOUNTPOINT_BIN_DIR)
+            - --v={{ .Values.node.logLevel }}
+          env:
+            - name: MOUNTPOINT_BIN_DIR
+              value: /mountpoint-s3/bin
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: comm
+              mountPath: /comm
+          {{- with .Values.mounterDaemonset.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: comm
+          emptyDir: {}
+{{- end }}

@@ -10,7 +10,13 @@ import (
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/mountpoint"
 )
 
-// Mounter is an interface for mount operations
+// Mounter is an interface for mount operations.
+// TODO: consider renaming to VolumeManager
+//
+// Mount must be idempotent: if the target is already a healthy Mountpoint mount,
+// it must return nil without creating a new mount. This is required because kubelet
+// may call NodePublishVolume multiple times for the same volume (e.g., credential refresh
+// via requiresRepublish, or retries after transient failures).
 type Mounter interface {
 	Mount(ctx context.Context, bucketName string, target string, credentialCtx credentialprovider.ProvideContext, args mountpoint.Args, fsGroup string, userEnv envprovider.Environment) error
 	Unmount(ctx context.Context, target string, credentialCtx credentialprovider.CleanupContext) error
