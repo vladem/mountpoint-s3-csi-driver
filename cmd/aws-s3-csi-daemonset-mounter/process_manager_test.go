@@ -143,7 +143,7 @@ func TestProcessManager_Launch_HappyPath(t *testing.T) {
 	// Verify tracked
 	pm.mu.Lock()
 	assert.Equals(t, 1, len(pm.processes))
-	assert.Equals(t, "mount-123", pm.processes[fr.handles[0].Pid()].mountId)
+	assert.Equals(t, fr.handles[0].Pid(), pm.processes["mount-123"].Pid())
 	pm.mu.Unlock()
 
 	// Clean exit
@@ -193,7 +193,8 @@ func TestProcessManager_Launch_MultipleProcesses(t *testing.T) {
 	// Only mount-c still tracked
 	pm.mu.Lock()
 	assert.Equals(t, 1, len(pm.processes))
-	assert.Equals(t, "mount-c", pm.processes[fr.handles[2].Pid()].mountId)
+	_, hasMountC := pm.processes["mount-c"]
+	assert.Equals(t, true, hasMountC)
 	pm.mu.Unlock()
 
 	// Error file written for mount-a, not for mount-b
@@ -211,6 +212,48 @@ func TestProcessManager_Launch_MultipleProcesses(t *testing.T) {
 	pm.mu.Lock()
 	assert.Equals(t, 0, len(pm.processes))
 	pm.mu.Unlock()
+}
+
+func TestProcessManager_Launch_DuplicateMountId_Rejected(t *testing.T) {
+	commDir := t.TempDir()
+	fr := &fakeProcessRunner{}
+	pm := NewProcessManager(commDir, fr)
+
+	dev1 := mountertest.OpenDevNull(t)
+	err := pm.Launch("same-mount", "/usr/bin/mount-s3", mountoptions.Options{
+		Fd:         int(dev1.Fd()),
+		BucketName: "bucket",
+	})
+	assert.NoError(t, err)
+
+	// Second launch with same mountId should fail
+	dev2 := mountertest.OpenDevNull(t)
+	err = pm.Launch("same-mount", "/usr/bin/mount-s3", mountoptions.Options{
+		Fd:         int(dev2.Fd()),
+		BucketName: "bucket",
+	})
+	if err == nil {
+		t.Fatal("Expected error for duplicate mountId, got nil")
+	}
+
+	// Only one process tracked
+	pm.mu.Lock()
+	assert.Equals(t, 1, len(pm.processes))
+	pm.mu.Unlock()
+
+	// After first exits, same mountId can be reused
+	fr.handles[0].Exit(0, "")
+	time.Sleep(10 * time.Millisecond)
+
+	dev3 := mountertest.OpenDevNull(t)
+	err = pm.Launch("same-mount", "/usr/bin/mount-s3", mountoptions.Options{
+		Fd:         int(dev3.Fd()),
+		BucketName: "bucket",
+	})
+	assert.NoError(t, err)
+
+	fr.handles[1].Exit(0, "")
+	pm.Shutdown()
 }
 
 func TestProcessManager_Shutdown_SendsSIGTERM(t *testing.T) {

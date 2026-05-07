@@ -24,31 +24,26 @@ import (
 const errorFilePerm = fs.FileMode(0600)
 const errorFileExt = ".error"
 
-// mountProcess tracks a running Mountpoint child process.
-type mountProcess struct {
-	mountId string
-	handle  ProcessHandle
-}
-
 // ProcessManager tracks and manages Mountpoint child processes.
 type ProcessManager struct {
 	commDir   string
 	runner    ProcessRunner
 	mu        sync.Mutex
-	processes map[int]*mountProcess // pid -> process info
-	wg        sync.WaitGroup        // tracks waiter goroutines
+	processes map[string]ProcessHandle // mountId -> process handle
+	wg        sync.WaitGroup           // tracks waiter goroutines
 }
 
 func NewProcessManager(commDir string, runner ProcessRunner) *ProcessManager {
 	return &ProcessManager{
 		commDir:   commDir,
 		runner:    runner,
-		processes: make(map[int]*mountProcess),
+		processes: make(map[string]ProcessHandle),
 	}
 }
 
 // Launch spawns a Mountpoint process for the given mount and waits for it asynchronously.
 // Takes ownership of options.Fd, caller must not close it after calling this function.
+// Returns an error if a process with the same mountId is already running.
 func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options mountoptions.Options) error {
 	fuseDev := os.NewFile(uintptr(options.Fd), "/dev/fuse")
 	if fuseDev == nil {
@@ -80,8 +75,17 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	cmd.Stdout = newPrefixWriter(os.Stdout, mountId)
 	cmd.Stderr = newPrefixWriter(os.Stderr, mountId)
 
+	// Hold lock across duplicate check and process start to prevent races.
+	pm.mu.Lock()
+	if _, exists := pm.processes[mountId]; exists {
+		pm.mu.Unlock()
+		fuseDev.Close()
+		return fmt.Errorf("mount %s already has a running process", mountId)
+	}
+
 	handle, err := pm.runner.Start(cmd)
 	if err != nil {
+		pm.mu.Unlock()
 		fuseDev.Close()
 		return fmt.Errorf("failed to start Mountpoint: %w", err)
 	}
@@ -89,12 +93,10 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	// Child has its own copy of the FD (kernel dup'd it during fork/exec).
 	fuseDev.Close()
 
-	pid := handle.Pid()
-	pm.mu.Lock()
-	pm.processes[pid] = &mountProcess{mountId: mountId, handle: handle}
+	pm.processes[mountId] = handle
 	pm.mu.Unlock()
 
-	klog.Infof("Launched Mountpoint for mount %s (pid %d)", mountId, pid)
+	klog.Infof("Launched Mountpoint for mount %s (pid %d)", mountId, handle.Pid())
 
 	pm.wg.Add(1)
 	go func() {
@@ -102,7 +104,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		exitCode, stderr := handle.Wait()
 
 		pm.mu.Lock()
-		delete(pm.processes, pid)
+		delete(pm.processes, mountId)
 		pm.mu.Unlock()
 
 		if exitCode != 0 {
@@ -122,8 +124,9 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 // Shutdown sends SIGTERM to all processes and waits for them to exit.
 func (pm *ProcessManager) Shutdown() {
 	pm.mu.Lock()
-	for _, proc := range pm.processes {
-		proc.handle.Signal(syscall.SIGTERM)
+	for mountId, handle := range pm.processes {
+		klog.Infof("Sending SIGTERM to Mountpoint for mount %s (pid %d)", mountId, handle.Pid())
+		handle.Signal(syscall.SIGTERM)
 	}
 	pm.mu.Unlock()
 
@@ -140,7 +143,6 @@ func newPrefixWriter(w io.Writer, mountId string) *prefixWriter {
 	return &prefixWriter{w: w, prefix: fmt.Sprintf("[%s] ", mountId)}
 }
 
-// todo: may insert new lines?
 func (pw *prefixWriter) Write(p []byte) (int, error) {
 	lines := bytes.Split(p, []byte("\n"))
 	for i, line := range lines {
@@ -162,8 +164,8 @@ func (pm *ProcessManager) LogStatusPeriodically(interval time.Duration) {
 		pm.mu.Lock()
 		tracked := len(pm.processes)
 		var mountIds []string
-		for _, proc := range pm.processes {
-			mountIds = append(mountIds, proc.mountId)
+		for id := range pm.processes {
+			mountIds = append(mountIds, id)
 		}
 		pm.mu.Unlock()
 
