@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,25 +22,32 @@ import (
 )
 
 const errorFilePerm = fs.FileMode(0600)
+const errorFileExt = ".error"
 
-// ChildManager tracks and manages Mountpoint child processes.
-type ChildManager struct {
-	commDir  string
-	mu       sync.Mutex
-	children map[string]*exec.Cmd // mountId -> running cmd
+// mountProcess tracks a running Mountpoint child process.
+type mountProcess struct {
+	mountId string
+	cmd     *exec.Cmd
 }
 
-func NewChildManager(commDir string) *ChildManager {
-	return &ChildManager{
-		commDir:  commDir,
-		children: make(map[string]*exec.Cmd),
+// ProcessManager tracks and manages Mountpoint child processes.
+type ProcessManager struct {
+	commDir   string
+	mu        sync.Mutex
+	processes map[int]*mountProcess // pid -> process info
+	wg        sync.WaitGroup        // tracks waiter goroutines
+}
+
+func NewProcessManager(commDir string) *ProcessManager {
+	return &ProcessManager{
+		commDir:   commDir,
+		processes: make(map[int]*mountProcess),
 	}
 }
 
-// Launch spawns a Mountpoint process for the given mount.
-// The caller retains ownership of options.Fd and must close it after Launch returns.
-// TODO: consider switching the user of the child process to isolate credential files.
-func (cm *ChildManager) Launch(mountId string, mountpointPath string, options mountoptions.Options) error {
+// RunInForeground spawns a Mountpoint process for the given mount and waits for it asynchronously by spawning a goroutine.
+// Takes ownership of options.Fd, caller must not close it after calling this function.
+func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options mountoptions.Options) error {
 	fuseDev := os.NewFile(uintptr(options.Fd), "/dev/fuse")
 	if fuseDev == nil {
 		return fmt.Errorf("invalid FUSE file descriptor %d", options.Fd)
@@ -73,17 +81,25 @@ func (cm *ChildManager) Launch(mountId string, mountpointPath string, options mo
 	cmd.Stderr = io.MultiWriter(newPrefixWriter(os.Stderr, mountId), &stderrBuf)
 
 	if err := cmd.Start(); err != nil {
+		fuseDev.Close()
 		return fmt.Errorf("failed to start Mountpoint: %w", err)
 	}
 
-	cm.mu.Lock()
-	cm.children[mountId] = cmd
-	cm.mu.Unlock()
+	// Child has its own copy of the FD (kernel dup'd it during fork/exec).
+	// Close our copy immediately rather than waiting for GC finalizer.
+	fuseDev.Close()
 
-	klog.Infof("Launched Mountpoint for mount %s (pid %d)", mountId, cmd.Process.Pid)
+	pid := cmd.Process.Pid
+	pm.mu.Lock()
+	pm.processes[pid] = &mountProcess{mountId: mountId, cmd: cmd}
+	pm.mu.Unlock()
+
+	klog.Infof("Launched Mountpoint for mount %s (pid %d)", mountId, pid)
 
 	// Wait for child in background
+	pm.wg.Add(1)
 	go func() {
+		defer pm.wg.Done()
 		err := cmd.Wait()
 		exitCode := 0
 		if err != nil {
@@ -94,16 +110,13 @@ func (cm *ChildManager) Launch(mountId string, mountpointPath string, options mo
 			exitCode = cmd.ProcessState.ExitCode()
 		}
 
-		cm.mu.Lock()
-		delete(cm.children, mountId)
-		cm.mu.Unlock()
+		pm.mu.Lock()
+		delete(pm.processes, pid)
+		pm.mu.Unlock()
 
 		if exitCode != 0 {
-			// TODO: make it a JSON
-			// TODO: probably write on success too, so that we return from NodeUnpublishVolume only when process terminates
-			errContent := fmt.Sprintf("exit_code=%d\n%s", exitCode, stderrBuf.String())
-			errPath := filepath.Join(cm.commDir, mountId+".error")
-			if writeErr := os.WriteFile(errPath, []byte(errContent), errorFilePerm); writeErr != nil {
+			errPath := filepath.Join(pm.commDir, mountId+errorFileExt)
+			if writeErr := os.WriteFile(errPath, stderrBuf.Bytes(), errorFilePerm); writeErr != nil {
 				klog.Errorf("Failed to write error file for mount %s: %v", mountId, writeErr)
 			}
 			klog.Errorf("Mountpoint for mount %s exited with code %d", mountId, exitCode)
@@ -115,29 +128,22 @@ func (cm *ChildManager) Launch(mountId string, mountpointPath string, options mo
 	return nil
 }
 
-// Shutdown sends SIGTERM to all children and waits for them to exit.
-func (cm *ChildManager) Shutdown() {
-	cm.mu.Lock()
-	children := make(map[string]*exec.Cmd, len(cm.children))
-	for k, v := range cm.children {
-		children[k] = v
+// Shutdown sends SIGTERM to all processes and waits for them to exit.
+func (pm *ProcessManager) Shutdown() {
+	pm.mu.Lock()
+	snapshot := make(map[int]*mountProcess, len(pm.processes))
+	for k, v := range pm.processes {
+		snapshot[k] = v
 	}
-	cm.mu.Unlock()
+	pm.mu.Unlock()
 
-	for mountId, cmd := range children {
-		klog.Infof("Sending SIGTERM to Mountpoint for mount %s (pid %d)", mountId, cmd.Process.Pid)
-		cmd.Process.Signal(syscall.SIGTERM)
+	for _, proc := range snapshot {
+		klog.Infof("Sending SIGTERM to Mountpoint for mount %s (pid %d)", proc.mountId, proc.cmd.Process.Pid)
+		proc.cmd.Process.Signal(syscall.SIGTERM)
 	}
 
-	// Wait for all children to exit (they'll be reaped by the goroutines in Launch)
-	for {
-		cm.mu.Lock()
-		remaining := len(cm.children)
-		cm.mu.Unlock()
-		if remaining == 0 {
-			break
-		}
-	}
+	// Wait for all waiter goroutines to finish (ensures processes are reaped and error files written)
+	pm.wg.Wait()
 }
 
 // prefixWriter wraps an io.Writer and prefixes each line with a mount ID.
@@ -166,21 +172,22 @@ func (pw *prefixWriter) Write(p []byte) (int, error) {
 
 // LogStatusPeriodically logs the number of tracked and actual child processes at the given interval.
 // TODO: metrics endpoint, otlp push export or CloudWatch EMF
-func (cm *ChildManager) LogStatusPeriodically(interval time.Duration) {
+func (pm *ProcessManager) LogStatusPeriodically(interval time.Duration) {
 	for {
 		time.Sleep(interval)
 
-		cm.mu.Lock()
-		tracked := len(cm.children)
+		pm.mu.Lock()
+		tracked := len(pm.processes)
 		var mountIds []string
-		for id := range cm.children {
-			mountIds = append(mountIds, id)
+		for _, proc := range pm.processes {
+			mountIds = append(mountIds, proc.mountId)
 		}
-		cm.mu.Unlock()
+		pm.mu.Unlock()
 
 		actual := countChildProcesses()
 		openFDs := countOpenFDs()
-		klog.Infof("Status: tracked=%d actual_children=%d open_fds=%d mounts=%v", tracked, actual, openFDs, mountIds)
+		goroutines := runtime.NumGoroutine()
+		klog.Infof("Status: tracked=%d actual_children=%d open_fds=%d goroutines=%d mounts=%v", tracked, actual, openFDs, goroutines, mountIds)
 	}
 }
 

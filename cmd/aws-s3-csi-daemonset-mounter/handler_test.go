@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,9 +13,21 @@ import (
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/mountpoint/mountoptions"
 )
 
+// These tests spawn child processes (simulating Mountpoint) that may persist until explicitly killed.
+// They are skipped by default to avoid orphaned processes on developer machines.
+// CI environments (containers) are safe — processes are cleaned up when the container exits.
+func TestMain(m *testing.M) {
+	if os.Getenv("DAEMONSET_MOUNTER_TESTS") == "" {
+		fmt.Println("Skipping daemonset mounter tests (set DAEMONSET_MOUNTER_TESTS=1 to enable)")
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
 func TestHandleConnection_HappyPath(t *testing.T) {
 	commDir := t.TempDir()
-	children := NewChildManager(commDir)
+	pm := NewProcessManager(commDir)
+	defer pm.Shutdown() // ensure all processes and awaiting goroutines complete
 
 	// Create a fake binary that reads from the passed FD (fd 3) and writes content to a file.
 	// This verifies the FD was correctly received via SCM_RIGHTS.
@@ -61,7 +74,7 @@ func TestHandleConnection_HappyPath(t *testing.T) {
 		t.Fatalf("Failed to accept: %v", err)
 	}
 
-	handleConnection(conn.(*net.UnixConn), fakeBin, children)
+	handleConnection(conn.(*net.UnixConn), fakeBin, pm)
 
 	// Write known content through the pipe — the child reads from fd 3 (the received FD)
 	testContent := "hello-from-fuse-fd"
@@ -83,7 +96,8 @@ func TestHandleConnection_HappyPath(t *testing.T) {
 
 func TestHandleConnection_MissingVolumeId(t *testing.T) {
 	commDir := t.TempDir()
-	children := NewChildManager(commDir)
+	pm := NewProcessManager(commDir)
+	defer pm.Shutdown() // ensure all processes and awaiting goroutines complete
 
 	sockPath := filepath.Join(commDir, "test.sock")
 	listener, err := net.Listen("unix", sockPath)
@@ -117,21 +131,22 @@ func TestHandleConnection_MissingVolumeId(t *testing.T) {
 		t.Fatalf("Failed to accept: %v", err)
 	}
 
-	handleConnection(conn.(*net.UnixConn), "/bin/sleep", children)
+	handleConnection(conn.(*net.UnixConn), "fakeBinName", pm)
 
 	// Verify no child was launched
-	children.mu.Lock()
-	count := len(children.children)
-	children.mu.Unlock()
+	pm.mu.Lock()
+	count := len(pm.processes)
+	pm.mu.Unlock()
 
 	if count != 0 {
-		t.Fatalf("Expected no children, got %d", count)
+		t.Fatalf("Expected no pm, got %d", count)
 	}
 }
 
-func TestChildManager_ErrorFile(t *testing.T) {
+func TestProcessManager_ErrorFile(t *testing.T) {
 	commDir := t.TempDir()
-	children := NewChildManager(commDir)
+	pm := NewProcessManager(commDir)
+	defer pm.Shutdown() // ensure all processes and awaiting goroutines complete
 
 	// Create a fake binary that exits with code 1 and writes to stderr
 	fakeBin := filepath.Join(commDir, "fake-fail")
@@ -155,7 +170,7 @@ func TestChildManager_ErrorFile(t *testing.T) {
 		VolumeId:   "error-vol",
 	}
 
-	err = children.Launch("error-vol", fakeBin, options)
+	err = pm.Launch("error-vol", fakeBin, options)
 	if err != nil {
 		t.Fatalf("Launch failed: %v", err)
 	}
@@ -174,16 +189,21 @@ func TestChildManager_ErrorFile(t *testing.T) {
 		t.Fatal("Expected non-empty error file")
 	}
 
-	if !bytes.Contains(content, []byte("exit_code=")) {
-		t.Fatalf("Expected error file to contain exit_code, got: %s", string(content))
+	if !bytes.Contains(content, []byte("mount failed")) {
+		t.Fatalf("Expected error file to be \"mount failed\", got: %s", string(content))
 	}
 }
 
-func TestChildManager_SequentialMultiMount(t *testing.T) {
+func TestProcessManager_SequentialMultiMount(t *testing.T) {
 	commDir := t.TempDir()
-	children := NewChildManager(commDir)
+	pm := NewProcessManager(commDir)
+	defer pm.Shutdown() // ensure all processes and awaiting goroutines complete
 
-	fakeBin := createFakeMountpoint(t, commDir)
+	fakeBin := filepath.Join(commDir, "fake-mountpoint")
+	script := "#!/bin/sh\nsleep 5\n"
+	if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
+		t.Fatalf("Failed to create fake mountpoint: %v", err)
+	}
 
 	for i, volId := range []string{"vol-1", "vol-2"} {
 		r, w, err := os.Pipe()
@@ -200,7 +220,7 @@ func TestChildManager_SequentialMultiMount(t *testing.T) {
 			VolumeId:   volId,
 		}
 
-		err = children.Launch(volId, fakeBin, options)
+		err = pm.Launch(volId, fakeBin, options)
 		if err != nil {
 			t.Fatalf("Launch %s failed: %v", volId, err)
 		}
@@ -209,32 +229,15 @@ func TestChildManager_SequentialMultiMount(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	children.mu.Lock()
-	count := len(children.children)
-	children.mu.Unlock()
+	pm.mu.Lock()
+	count := len(pm.processes)
+	pm.mu.Unlock()
 
 	if count != 2 {
-		t.Fatalf("Expected 2 children, got %d", count)
+		t.Fatalf("Expected 2 processes, got %d", count)
 	}
-
-	// Cleanup
-	children.mu.Lock()
-	for _, cmd := range children.children {
-		cmd.Process.Kill()
-	}
-	children.mu.Unlock()
-
-	time.Sleep(200 * time.Millisecond)
 }
 
-// createFakeMountpoint creates a shell script that ignores all arguments and sleeps forever.
-// This simulates a Mountpoint binary for testing purposes.
-func createFakeMountpoint(t *testing.T, dir string) string {
-	t.Helper()
-	fakeBin := filepath.Join(dir, "fake-mountpoint")
-	script := "#!/bin/sh\nsleep 999\n"
-	if err := os.WriteFile(fakeBin, []byte(script), 0755); err != nil {
-		t.Fatalf("Failed to create fake mountpoint: %v", err)
-	}
-	return fakeBin
-}
+// TODO: env passing test
+// TODO: duplicated MP id test
+// TODO: parameters: bucket, /dev/fd/3, --foreground, (and extra)

@@ -4,8 +4,6 @@
 //
 // Unlike the pod-per-mount architecture (V2), this binary manages multiple Mountpoint processes
 // within a single pod. Each mount request produces exactly one Mountpoint child process.
-//
-// See /docs/ARCHITECTURE.md for more details.
 package main
 
 import (
@@ -48,10 +46,9 @@ func main() {
 
 	klog.Infof("Listening on %s, mountpoint binary: %s", sockPath, mountpointPath)
 
-	children := NewChildManager(*commDir)
+	pm := NewProcessManager(*commDir)
 
-	// Handle shutdown signals
-	// TODO: consider delaying termination on syscall.SIGTERM (reasoning: terminate after MP processes exit, which should be triggered by NodeUnpublishVolume; but in case of orphaned MP processes KILL would be required)
+	// Handle shutdown signals: terminate all MP processes gracefully
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
@@ -61,7 +58,7 @@ func main() {
 	}()
 
 	// Periodic observability: log number of tracked and actual child processes
-	go children.LogStatusPeriodically(30 * time.Second)
+	go pm.LogStatusPeriodically(30 * time.Second)
 
 	// Accept loop — sequential, kernel backlog queues concurrent requests
 	for {
@@ -76,8 +73,8 @@ func main() {
 			continue
 		}
 
-		handleConnection(conn.(*net.UnixConn), mountpointPath, children)
+		handleConnection(conn.(*net.UnixConn), mountpointPath, pm)
 	}
 
-	children.Shutdown()
+	pm.Shutdown()
 }

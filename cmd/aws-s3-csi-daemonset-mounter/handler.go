@@ -10,7 +10,7 @@ import (
 )
 
 // handleConnection receives mount options from a single connection and spawns a Mountpoint child process.
-func handleConnection(conn *net.UnixConn, mountpointPath string, children *ChildManager) {
+func handleConnection(conn *net.UnixConn, mountpointPath string, pm *ProcessManager) {
 	defer conn.Close()
 
 	options, err := mountoptions.RecvOnConn(conn)
@@ -19,18 +19,16 @@ func handleConnection(conn *net.UnixConn, mountpointPath string, children *Child
 		return
 	}
 
-	// Caller owns the FD — close it after handing off to the child process.
-	defer syscall.Close(options.Fd)
-
 	mountId := options.VolumeId
 	if mountId == "" {
+		syscall.Close(options.Fd)
 		klog.Error("Received mount options without mount identifier, cannot track child process")
 		return
 	}
 
 	klog.Infof("Received mount request for mount %s, bucket %s", mountId, options.BucketName)
 
-	err = children.Launch(mountId, mountpointPath, options)
+	err = pm.Launch(mountId, mountpointPath, options) // ownership of options.Fd is transferred here
 	if err != nil {
 		klog.Errorf("Failed to launch Mountpoint for mount %s: %v", mountId, err)
 	}
