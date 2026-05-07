@@ -27,25 +27,27 @@ const errorFileExt = ".error"
 // mountProcess tracks a running Mountpoint child process.
 type mountProcess struct {
 	mountId string
-	cmd     *exec.Cmd
+	handle  ProcessHandle
 }
 
 // ProcessManager tracks and manages Mountpoint child processes.
 type ProcessManager struct {
 	commDir   string
+	runner    ProcessRunner
 	mu        sync.Mutex
 	processes map[int]*mountProcess // pid -> process info
 	wg        sync.WaitGroup        // tracks waiter goroutines
 }
 
-func NewProcessManager(commDir string) *ProcessManager {
+func NewProcessManager(commDir string, runner ProcessRunner) *ProcessManager {
 	return &ProcessManager{
 		commDir:   commDir,
+		runner:    runner,
 		processes: make(map[int]*mountProcess),
 	}
 }
 
-// RunInForeground spawns a Mountpoint process for the given mount and waits for it asynchronously by spawning a goroutine.
+// Launch spawns a Mountpoint process for the given mount and waits for it asynchronously.
 // Takes ownership of options.Fd, caller must not close it after calling this function.
 func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options mountoptions.Options) error {
 	fuseDev := os.NewFile(uintptr(options.Fd), "/dev/fuse")
@@ -75,40 +77,29 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	// cmd.Env = childEnv
 
 	cmd.Env = options.Env
-
-	var stderrBuf bytes.Buffer
 	cmd.Stdout = newPrefixWriter(os.Stdout, mountId)
-	cmd.Stderr = io.MultiWriter(newPrefixWriter(os.Stderr, mountId), &stderrBuf)
+	cmd.Stderr = newPrefixWriter(os.Stderr, mountId)
 
-	if err := cmd.Start(); err != nil {
+	handle, err := pm.runner.Start(cmd)
+	if err != nil {
 		fuseDev.Close()
 		return fmt.Errorf("failed to start Mountpoint: %w", err)
 	}
 
 	// Child has its own copy of the FD (kernel dup'd it during fork/exec).
-	// Close our copy immediately rather than waiting for GC finalizer.
 	fuseDev.Close()
 
-	pid := cmd.Process.Pid
+	pid := handle.Pid()
 	pm.mu.Lock()
-	pm.processes[pid] = &mountProcess{mountId: mountId, cmd: cmd}
+	pm.processes[pid] = &mountProcess{mountId: mountId, handle: handle}
 	pm.mu.Unlock()
 
 	klog.Infof("Launched Mountpoint for mount %s (pid %d)", mountId, pid)
 
-	// Wait for child in background
 	pm.wg.Add(1)
 	go func() {
 		defer pm.wg.Done()
-		err := cmd.Wait()
-		exitCode := 0
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				exitCode = exitErr.ExitCode()
-			}
-		} else {
-			exitCode = cmd.ProcessState.ExitCode()
-		}
+		exitCode, stderr := handle.Wait()
 
 		pm.mu.Lock()
 		delete(pm.processes, pid)
@@ -116,7 +107,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 		if exitCode != 0 {
 			errPath := filepath.Join(pm.commDir, mountId+errorFileExt)
-			if writeErr := os.WriteFile(errPath, stderrBuf.Bytes(), errorFilePerm); writeErr != nil {
+			if writeErr := os.WriteFile(errPath, stderr, errorFilePerm); writeErr != nil {
 				klog.Errorf("Failed to write error file for mount %s: %v", mountId, writeErr)
 			}
 			klog.Errorf("Mountpoint for mount %s exited with code %d", mountId, exitCode)
@@ -131,18 +122,11 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 // Shutdown sends SIGTERM to all processes and waits for them to exit.
 func (pm *ProcessManager) Shutdown() {
 	pm.mu.Lock()
-	snapshot := make(map[int]*mountProcess, len(pm.processes))
-	for k, v := range pm.processes {
-		snapshot[k] = v
+	for _, proc := range pm.processes {
+		proc.handle.Signal(syscall.SIGTERM)
 	}
 	pm.mu.Unlock()
 
-	for _, proc := range snapshot {
-		klog.Infof("Sending SIGTERM to Mountpoint for mount %s (pid %d)", proc.mountId, proc.cmd.Process.Pid)
-		proc.cmd.Process.Signal(syscall.SIGTERM)
-	}
-
-	// Wait for all waiter goroutines to finish (ensures processes are reaped and error files written)
 	pm.wg.Wait()
 }
 
@@ -156,8 +140,8 @@ func newPrefixWriter(w io.Writer, mountId string) *prefixWriter {
 	return &prefixWriter{w: w, prefix: fmt.Sprintf("[%s] ", mountId)}
 }
 
+// todo: may insert new lines?
 func (pw *prefixWriter) Write(p []byte) (int, error) {
-	// Prefix each line
 	lines := bytes.Split(p, []byte("\n"))
 	for i, line := range lines {
 		if len(line) == 0 && i == len(lines)-1 {
@@ -171,7 +155,6 @@ func (pw *prefixWriter) Write(p []byte) (int, error) {
 }
 
 // LogStatusPeriodically logs the number of tracked and actual child processes at the given interval.
-// TODO: metrics endpoint, otlp push export or CloudWatch EMF
 func (pm *ProcessManager) LogStatusPeriodically(interval time.Duration) {
 	for {
 		time.Sleep(interval)
@@ -221,8 +204,6 @@ func countChildProcesses() int {
 		if err != nil {
 			continue
 		}
-		// Format: pid (comm) state ppid ...
-		// Find ppid after the closing paren
 		fields := strings.SplitN(string(stat[strings.LastIndex(string(stat), ")")+2:]), " ", 3)
 		if len(fields) >= 2 {
 			ppid, _ := strconv.Atoi(fields[1])

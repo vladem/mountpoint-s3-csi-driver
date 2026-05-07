@@ -46,7 +46,7 @@ func main() {
 
 	klog.Infof("Listening on %s, mountpoint binary: %s", sockPath, mountpointPath)
 
-	pm := NewProcessManager(*commDir)
+	pm := NewProcessManager(*commDir, &defaultProcessRunner{})
 
 	// Handle shutdown signals: terminate all MP processes gracefully
 	sigCh := make(chan os.Signal, 1)
