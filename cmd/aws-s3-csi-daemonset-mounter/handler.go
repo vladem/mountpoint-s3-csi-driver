@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"syscall"
+	"time"
 
 	"k8s.io/klog/v2"
 
@@ -10,10 +11,15 @@ import (
 )
 
 // handleConnection receives mount options from a single connection and spawns a Mountpoint child process.
-func handleConnection(conn *net.UnixConn, mountpointPath string, pm *ProcessManager) {
+func handleConnection(conn *net.UnixConn, mountpointPath string, pm *ProcessManager, recvTimeout time.Duration) {
 	defer conn.Close()
 
-	options, err := mountoptions.RecvOnConn(conn)
+	var deadline time.Time
+	if recvTimeout > 0 {
+		deadline = time.Now().Add(recvTimeout)
+	}
+
+	options, err := mountoptions.RecvOnConn(conn, deadline)
 	if err != nil {
 		klog.Errorf("Failed to receive mount options: %v", err)
 		return

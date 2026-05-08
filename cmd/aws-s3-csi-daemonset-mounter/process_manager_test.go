@@ -103,7 +103,7 @@ func TestHandleConnection_PropagatesOptionsToRunner(t *testing.T) {
 	conn, err := listener.Accept()
 	assert.NoError(t, err)
 
-	handleConnection(conn.(*net.UnixConn), "/opt/mount-s3", pm)
+	handleConnection(conn.(*net.UnixConn), "/opt/mount-s3", pm, 5*time.Second)
 
 	// Verify runner received the options
 	fr.mu.Lock()
@@ -280,6 +280,67 @@ func TestProcessManager_Shutdown_SendsSIGTERM(t *testing.T) {
 	}()
 
 	pm.Shutdown()
+}
+
+// TestHandleConnection_NoFdLeak verifies that handleConnection does not leak file descriptors
+// across multiple iterations, including the error path (empty VolumeId).
+// NOTE: Do not use t.Parallel() here — fd counting via /proc/self/fd is process-global
+// and would be unreliable if other tests open/close fds concurrently.
+func TestHandleConnection_NoFdLeak(t *testing.T) {
+	commDir := t.TempDir()
+	fr := &fakeProcessRunner{}
+	pm := NewProcessManager(commDir, fr)
+
+	sockPath := filepath.Join(commDir, "test.sock")
+	listener, err := net.Listen("unix", sockPath)
+	assert.NoError(t, err)
+	defer listener.Close()
+
+	fdsBefore := countOpenFds(t)
+
+	const iterations = 5
+	for i := range iterations {
+		dev := mountertest.OpenDevNull(t)
+		sendDone := make(chan struct{})
+		volumeId := fmt.Sprintf("vol-%d", i)
+		if i == iterations-1 {
+			volumeId = "" // no VolumeId — handleConnection should close fd without launching
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			mountoptions.Send(ctx, sockPath, mountoptions.Options{
+				Fd:         int(dev.Fd()),
+				BucketName: "bucket",
+				VolumeId:   volumeId,
+			})
+			dev.Close()
+			close(sendDone)
+		}()
+
+		conn, err := listener.Accept()
+		assert.NoError(t, err)
+		handleConnection(conn.(*net.UnixConn), "/opt/mount-s3", pm, 5*time.Second)
+		<-sendDone
+		if i < iterations-1 {
+			fr.handles[i].Exit(0, "")
+		}
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	pm.Shutdown()
+
+	fdsAfter := countOpenFds(t)
+	if fdsAfter > fdsBefore {
+		t.Errorf("fd leak: %d before, %d after", fdsBefore, fdsAfter)
+	}
+}
+
+func countOpenFds(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	assert.NoError(t, err)
+	return len(entries)
 }
 
 func TestProcessManager_Launch_ErrorExit_WritesErrorFile(t *testing.T) {

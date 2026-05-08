@@ -21,6 +21,7 @@ import (
 var (
 	commDir          = flag.String("comm-dir", "/comm", "Directory for communication socket and error files")
 	mountpointBinDir = flag.String("mountpoint-bin-dir", os.Getenv("MOUNTPOINT_BIN_DIR"), "Directory of mount-s3 binary")
+	recvTimeout      = flag.Duration("recv-timeout", 30*time.Second, "Timeout for receiving mount options from a connection")
 )
 
 const (
@@ -73,7 +74,7 @@ func main() {
 			continue
 		}
 
-		handleConnection(conn.(*net.UnixConn), mountpointPath, pm)
+		handleConnection(conn.(*net.UnixConn), mountpointPath, pm, *recvTimeout)
 	}
 
 	pm.Shutdown()

@@ -131,16 +131,23 @@ func Recv(ctx context.Context, sockPath string) (Options, error) {
 		return Options{}, fmt.Errorf("failed to accept connection from unix socket %s: %w", sockPath, err)
 	}
 
-	return RecvOnConn(conn.(*net.UnixConn))
+	deadline, _ := ctx.Deadline()
+	return RecvOnConn(conn.(*net.UnixConn), deadline)
 }
 
 // RecvOnConn receives mount options from an already-accepted connection.
-// Unlike Recv which creates and manages its own listener, this function reads from a pre-existing connection.
-// This is used by the daemonset mounter which maintains a persistent listener.
-func RecvOnConn(conn *net.UnixConn) (Options, error) {
+// If deadline is non-zero, a read deadline is set on the connection.
+func RecvOnConn(conn *net.UnixConn, deadline time.Time) (Options, error) {
+	if !deadline.IsZero() {
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			return Options{}, fmt.Errorf("failed to set read deadline on connection: %w", err)
+		}
+	}
+
 	messageBuf := make([]byte, 0)
 	unixRightsBuf := make([]byte, 0)
 
+	// Read in a loop to consume the whole message
 	for {
 		message := make([]byte, messageRecvSize)
 		unixRights := make([]byte, unixRightsRecvSize)
