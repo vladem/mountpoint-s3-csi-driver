@@ -24,6 +24,13 @@ import (
 const errorFilePerm = fs.FileMode(0600)
 const errorFileExt = ".error"
 
+const (
+	// UID/GID range for child process isolation.
+	// Each Mountpoint child runs as a unique UID so processes cannot access each other's files.
+	childUidBase = uint32(2000)
+	childUidMax  = uint32(65534)
+)
+
 // ProcessManager tracks and manages Mountpoint child processes.
 type ProcessManager struct {
 	commDir   string
@@ -31,6 +38,7 @@ type ProcessManager struct {
 	mu        sync.Mutex
 	processes map[string]ProcessHandle // mountId -> process handle
 	wg        sync.WaitGroup           // tracks waiter goroutines
+	nextUid   uint32
 }
 
 func NewProcessManager(commDir string, runner ProcessRunner) *ProcessManager {
@@ -38,7 +46,19 @@ func NewProcessManager(commDir string, runner ProcessRunner) *ProcessManager {
 		commDir:   commDir,
 		runner:    runner,
 		processes: make(map[string]ProcessHandle),
+		nextUid:   childUidBase,
 	}
+}
+
+// allocateUid returns the next available UID for a child process, wrapping around at childUidMax.
+// TODO: use a map? we have to error out if uid is already in use
+func (pm *ProcessManager) allocateUid() uint32 {
+	uid := pm.nextUid
+	pm.nextUid++
+	if pm.nextUid > childUidMax {
+		pm.nextUid = childUidBase
+	}
+	return uid
 }
 
 // Launch spawns a Mountpoint process for the given mount and waits for it asynchronously.
@@ -53,6 +73,30 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	args := mountpoint.ParseArgs(options.Args)
 	args.Set(mountpoint.ArgForeground, mountpoint.ArgNoValue)
 
+	// Allocate a unique UID/GID for this child process.
+	// The 0→non-zero UID transition causes the kernel to clear all capabilities,
+	// so the child process cannot setuid, override file permissions, or signal other processes.
+	childUid := pm.allocateUid()
+	childGid := childUid
+
+	// If cache is enabled, rewrite --cache to a per-mount directory and chown it to the child.
+	// The parent dir (/comm/cache) is 0711 so children can traverse but not list siblings.
+	var cacheDir string
+	if _, ok := args.Value(mountpoint.ArgCache); ok {
+		cacheParent := filepath.Join(pm.commDir, "cache")
+		os.Mkdir(cacheParent, 0777)
+		cacheDir = filepath.Join(cacheParent, mountId)
+		if mkErr := os.Mkdir(cacheDir, 0700); mkErr != nil {
+			fuseDev.Close()
+			return fmt.Errorf("failed to create cache dir for mount %s: %w", mountId, mkErr)
+		}
+		if chErr := os.Chown(cacheDir, int(childUid), int(childGid)); chErr != nil {
+			fuseDev.Close()
+			return fmt.Errorf("failed to chown cache dir for mount %s: %w", mountId, chErr)
+		}
+		args.Set(mountpoint.ArgCache, cacheDir)
+	}
+
 	cmdArgs := append([]string{
 		options.BucketName,
 		"/dev/fd/3", // ExtraFiles[0] becomes fd 3
@@ -60,6 +104,12 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 	cmd := exec.Command(mountpointPath, cmdArgs...)
 	cmd.ExtraFiles = []*os.File{fuseDev}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{
+			Uid: childUid,
+			Gid: childGid,
+		},
+	}
 
 	// TODO: we might need to make the child to inherit credentials ENV from this process (for driver-level creds)
 	// e.g. AWS_ROLE_ARN, AWS_WEB_IDENTITY_TOKEN_FILE,
@@ -106,6 +156,13 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		pm.mu.Lock()
 		delete(pm.processes, mountId)
 		pm.mu.Unlock()
+
+		// Clean up per-mount cache directory (requires CAP_DAC_OVERRIDE to remove child-owned files).
+		if cacheDir != "" {
+			if rmErr := os.RemoveAll(cacheDir); rmErr != nil {
+				klog.Warningf("Failed to remove cache dir %s for mount %s: %v", cacheDir, mountId, rmErr)
+			}
+		}
 
 		if exitCode != 0 {
 			errPath := filepath.Join(pm.commDir, mountId+errorFileExt)

@@ -59,8 +59,19 @@ spec:
             - name: MOUNTPOINT_BIN_DIR
               value: /mountpoint-s3/bin
           securityContext:
+            runAsUser: 0
+            runAsGroup: 0
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - SETUID
+                - SETGID
+                - KILL
+                - CHOWN
+                - DAC_OVERRIDE
           volumeMounts:
             - name: comm
               mountPath: /comm
