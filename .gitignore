@@ -9,3 +9,6 @@ go.work.sum
 cover.out
 cover.html
 .terraform/
+specs/
+notes/
+scripts/

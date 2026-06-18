@@ -27,7 +27,7 @@ const errorFileExt = ".error"
 const (
 	// UID/GID range for child process isolation.
 	// Each Mountpoint child runs as a unique UID so processes cannot access each other's files.
-	childUidBase = uint32(2000)
+	childUidBase = uint32(2001)
 	childUidMax  = uint32(65534)
 )
 
@@ -106,22 +106,13 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	cmd.ExtraFiles = []*os.File{fuseDev}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Credential: &syscall.Credential{
-			Uid: childUid,
-			Gid: childGid,
+			Uid:    childUid,
+			Gid:    childGid,
+			Groups: []uint32{childGid, sharedCredentialGid},
 		},
 	}
 
-	// TODO: we might need to make the child to inherit credentials ENV from this process (for driver-level creds)
-	// e.g. AWS_ROLE_ARN, AWS_WEB_IDENTITY_TOKEN_FILE,
-	//      AWS_CONTAINER_CREDENTIALS_FULL_URI, AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
-	//
-	// Something like:
-	// inheritedEnv := captureCredentialEnv()
-	// childEnv := inheritedEnv
-	// childEnv = append(childEnv, options.Env...) // options.Env overrides (pod-level creds)
-	// cmd.Env = childEnv
-
-	cmd.Env = options.Env
+	cmd.Env = mergeEnv(credentialEnvFromProcess(), options.Env)
 	cmd.Stdout = newPrefixWriter(os.Stdout, mountId)
 	cmd.Stderr = newPrefixWriter(os.Stderr, mountId)
 
@@ -272,4 +263,50 @@ func countChildProcesses() int {
 		}
 	}
 	return count
+}
+
+// credentialEnvFromProcess captures AWS credential-related environment variables from the current process.
+// These are inherited by child Mountpoint processes for driver-level credentials.
+var credentialEnvKeys = []string{
+	"AWS_ROLE_ARN",
+	"AWS_WEB_IDENTITY_TOKEN_FILE",
+	"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+	"AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+	"AWS_DEFAULT_REGION",
+	"AWS_REGION",
+	"AWS_SHARED_CREDENTIALS_FILE",
+	"AWS_CONFIG_FILE",
+}
+
+func credentialEnvFromProcess() []string {
+	var env []string
+	for _, key := range credentialEnvKeys {
+		if val, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+val)
+		}
+	}
+	return env
+}
+
+// mergeEnv returns base with overrides applied. Keys in overrides replace matching keys in base.
+func mergeEnv(base, overrides []string) []string {
+	if len(overrides) == 0 {
+		return base
+	}
+	merged := make(map[string]string, len(base)+len(overrides))
+	for _, entry := range base {
+		if k, v, ok := strings.Cut(entry, "="); ok {
+			merged[k] = v
+		}
+	}
+	for _, entry := range overrides {
+		if k, v, ok := strings.Cut(entry, "="); ok {
+			merged[k] = v
+		}
+	}
+	result := make([]string, 0, len(merged))
+	for k, v := range merged {
+		result = append(result, k+"="+v)
+	}
+	return result
 }

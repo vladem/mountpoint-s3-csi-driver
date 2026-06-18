@@ -47,6 +47,12 @@ func main() {
 
 	klog.Infof("Listening on %s, mountpoint binary: %s", sockPath, mountpointPath)
 
+	// Copy IRSA token to a shared location readable by child processes.
+	// Must happen before any mount requests are accepted.
+	if tokenPath := startTokenCopier(*commDir); tokenPath != "" {
+		os.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenPath)
+	}
+
 	pm := NewProcessManager(*commDir, &defaultProcessRunner{})
 
 	// Handle shutdown signals: terminate all MP processes gracefully
