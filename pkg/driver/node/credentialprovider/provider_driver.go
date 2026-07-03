@@ -107,7 +107,7 @@ func (c *Provider) cleanupFromDriver(cleanupCtx CleanupContext) error {
 func provideStsWebIdentityCredentialsFromDriver(provideCtx ProvideContext) (envprovider.Environment, error) {
 	driverServiceAccountTokenFile := os.Getenv(envprovider.EnvWebIdentityTokenFile)
 	tokenFile := filepath.Join(provideCtx.WritePath, webIdentityServiceAccountTokenName)
-	err := util.ReplaceFile(tokenFile, driverServiceAccountTokenFile, CredentialFilePerm)
+	err := util.CopyReplaceFile(tokenFile, driverServiceAccountTokenFile, provideCtx.GetCredentialFilePerm(), provideCtx.FileOwnership)
 	if err != nil {
 		return nil, fmt.Errorf("credentialprovider: sts-web-identity: failed to copy driver's service account token: %w", err)
 	}
@@ -122,7 +122,7 @@ func provideStsWebIdentityCredentialsFromDriver(provideCtx ProvideContext) (envp
 // It basically copies driver's injected service account token to [provideCtx.WritePath].
 func provideContainerCredentialsFromDriver(provideCtx ProvideContext, containerAuthorizationTokenFile string, containerCredentialsFullURI string) (envprovider.Environment, error) {
 	tokenFile := filepath.Join(provideCtx.WritePath, eksPodIdentityServiceAccountTokenName)
-	err := util.ReplaceFile(tokenFile, containerAuthorizationTokenFile, CredentialFilePerm)
+	err := util.CopyReplaceFile(tokenFile, containerAuthorizationTokenFile, provideCtx.GetCredentialFilePerm(), provideCtx.FileOwnership)
 	if err != nil {
 		return nil, fmt.Errorf("credentialprovider: container: failed to copy driver's service account token: %w", err)
 	}
@@ -139,9 +139,10 @@ func provideContainerCredentialsFromDriver(provideCtx ProvideContext, containerA
 func provideLongTermCredentialsFromDriver(provideCtx ProvideContext, accessKeyID, secretAccessKey, sessionToken string) (envprovider.Environment, error) {
 	prefix := driverLevelLongTermCredentialsProfilePrefix(provideCtx.GetCredentialPodID(), provideCtx.VolumeID, provideCtx.MountKind)
 	awsProfile, err := awsprofile.Create(awsprofile.Settings{
-		Basepath: provideCtx.WritePath,
-		Prefix:   prefix,
-		FilePerm: CredentialFilePerm,
+		Basepath:      provideCtx.WritePath,
+		Prefix:        prefix,
+		FilePerm:      provideCtx.GetCredentialFilePerm(),
+		FileOwnership: provideCtx.FileOwnership,
 	}, awsprofile.Credentials{
 		AccessKeyID:     accessKeyID,
 		SecretAccessKey: secretAccessKey,

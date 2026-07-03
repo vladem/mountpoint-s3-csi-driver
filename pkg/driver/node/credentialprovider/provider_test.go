@@ -17,6 +17,7 @@ import (
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider/awsprofile/awsprofiletest"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/envprovider"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util/testutil"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util/testutil/assert"
 )
@@ -405,6 +406,42 @@ func TestProvidingDriverLevelCredentials(t *testing.T) {
 			assert.Equals(t, envprovider.Environment{}, env)
 		}
 	})
+
+	t.Run("daemonset file permissions", func(t *testing.T) {
+		setEnvForLongTermCredentials(t)
+		setEnvForStsWebIdentityCredentials(t)
+		setEnvForContainerCredentials(t)
+
+		writePath := t.TempDir()
+		provideCtx := credentialprovider.ProvideContext{
+			AuthenticationSource: credentialprovider.AuthenticationSourceDriver,
+			WritePath:            writePath,
+			EnvPath:              testEnvPath,
+			WorkloadPodID:        testPodID,
+			VolumeID:             testVolumeID,
+			MountKind:            credentialprovider.MountKindDaemonset,
+			FileOwnership:        &util.FileOwnership{UID: os.Getuid(), GID: os.Getgid()},
+		}
+
+		_, _, err := provider.Provide(context.Background(), provideCtx)
+		assert.NoError(t, err)
+
+		expectedPerm := credentialprovider.DaemonsetMounterCredentialFilePerm
+
+		awsprofiletest.AssertCredentialsFromAWSProfile(t, "s3-csi",
+			expectedPerm,
+			filepath.Join(writePath, "s3-csi-config"),
+			filepath.Join(writePath, "s3-csi-credentials"),
+			testAccessKeyID, testSecretAccessKey, testSessionToken)
+
+		info, err := os.Stat(filepath.Join(writePath, testWebIdentityServiceAccountToken))
+		assert.NoError(t, err)
+		assert.Equals(t, expectedPerm, info.Mode().Perm())
+
+		info, err = os.Stat(filepath.Join(writePath, testEKSPodIdentityServiceAccountToken))
+		assert.NoError(t, err)
+		assert.Equals(t, expectedPerm, info.Mode().Perm())
+	})
 }
 
 func TestProvidingPodLevelCredentials(t *testing.T) {
@@ -538,6 +575,58 @@ func TestProvidingPodLevelCredentials(t *testing.T) {
 			"AWS_DEFAULT_REGION": testIMDSRegion,
 		}, env)
 		assertWebIdentityTokenFile(t, filepath.Join(writePath, testPodMounterPodLevelServiceAccountToken))
+	})
+
+	t.Run("daemonset file permissions", func(t *testing.T) {
+		baseProvideCtx := credentialprovider.ProvideContext{
+			AuthenticationSource: credentialprovider.AuthenticationSourcePod,
+			EnvPath:              testEnvPath,
+			WorkloadPodID:        testPodID,
+			VolumeID:             testVolumeID,
+			PodNamespace:         testPodNamespace,
+			ServiceAccountName:   testPodServiceAccount,
+			ServiceAccountTokens: serviceAccountTokens(t, tokens{
+				serviceAccountTokenAudienceSTS: {Token: testWebIdentityToken},
+				serviceAccountTokenAudienceEKS: {Token: testContainerAuthorizationToken},
+			}),
+			MountKind:     credentialprovider.MountKindDaemonset,
+			FileOwnership: &util.FileOwnership{UID: os.Getuid(), GID: os.Getgid()},
+		}
+
+		t.Run("IRSA", func(t *testing.T) {
+			clientset := fake.NewSimpleClientset(serviceAccount(testPodServiceAccount, testPodNamespace, map[string]string{
+				"eks.amazonaws.com/role-arn": testRoleARN,
+			}))
+			provider := credentialprovider.New(clientset.CoreV1(), dummyRegionProvider)
+
+			provideCtx := baseProvideCtx
+			provideCtx.WritePath = t.TempDir()
+			provideCtx.ServiceAccountEKSRoleARN = testRoleARN
+
+			_, _, err := provider.Provide(context.Background(), provideCtx)
+			assert.NoError(t, err)
+
+			info, err := os.Stat(filepath.Join(provideCtx.WritePath, testWebIdentityServiceAccountToken))
+			assert.NoError(t, err)
+			assert.Equals(t, credentialprovider.DaemonsetMounterCredentialFilePerm, info.Mode().Perm())
+		})
+
+		t.Run("EKS Pod Identity", func(t *testing.T) {
+			t.Setenv("EKS_POD_IDENTITY_AGENT_CONTAINER_CREDENTIALS_FULL_URI", "http://169.254.170.23/v1/credentials")
+
+			clientset := fake.NewSimpleClientset(serviceAccount(testPodServiceAccount, testPodNamespace, map[string]string{}))
+			provider := credentialprovider.New(clientset.CoreV1(), dummyRegionProvider)
+
+			provideCtx := baseProvideCtx
+			provideCtx.WritePath = t.TempDir()
+
+			_, _, err := provider.Provide(context.Background(), provideCtx)
+			assert.NoError(t, err)
+
+			info, err := os.Stat(filepath.Join(provideCtx.WritePath, testEKSPodIdentityServiceAccountToken))
+			assert.NoError(t, err)
+			assert.Equals(t, credentialprovider.DaemonsetMounterCredentialFilePerm, info.Mode().Perm())
+		})
 	})
 
 	t.Run("missing information", func(t *testing.T) {

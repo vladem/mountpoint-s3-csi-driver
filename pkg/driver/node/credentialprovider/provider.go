@@ -17,6 +17,7 @@ import (
 	k8sstrings "k8s.io/utils/strings"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/envprovider"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util"
 )
 
 // CredentialFilePerm is the default permissions to be used for credential files.
@@ -24,10 +25,16 @@ import (
 // Group access is needed as Mountpoint Pod is run as non-root user
 const CredentialFilePerm = fs.FileMode(0640)
 
+// For DaemonsetMounter only owner can read the credential file, no write permissions
+const DaemonsetMounterCredentialFilePerm = fs.FileMode(0400)
+
 // CredentialDirPerm is the default permissions to be used for credential directories.
 // It's only readable, listable (execute bit), and writeable by the owner and group.
 // Group access is needed as Mountpoint Pod is run as non-root user
 const CredentialDirPerm = fs.FileMode(0750)
+
+// For DaemonsetMounter only owner can access the directory
+const DaemonsetMounterCredentialDirPerm = fs.FileMode(0700)
 
 const (
 	webIdentityServiceAccountTokenName    = "token"
@@ -95,6 +102,9 @@ type ProvideContext struct {
 	// MountKind indicates whether the mount is managed by systemd, pod mounter or daemonset mounter
 	MountKind MountKind
 
+	// FileOwnership specifies UID/GID for credential files. Nil uses process defaults.
+	FileOwnership *util.FileOwnership
+
 	// The following values are provided from CSI volume context.
 	AuthenticationSource     AuthenticationSource
 	PodNamespace             string
@@ -161,6 +171,13 @@ func (p *ProvideContext) GetCredentialPodID() string {
 		return p.MountpointPodID
 	}
 	return p.WorkloadPodID
+}
+
+func (p *ProvideContext) GetCredentialFilePerm() fs.FileMode {
+	if p.MountKind == MountKindDaemonset {
+		return DaemonsetMounterCredentialFilePerm
+	}
+	return CredentialFilePerm
 }
 
 // A CleanupContext contains parameters needed to clean up credentials after volume unmount.

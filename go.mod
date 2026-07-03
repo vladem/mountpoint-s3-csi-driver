@@ -9,7 +9,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.9
 	github.com/container-storage-interface/spec v1.9.0
 	github.com/golang/mock v1.6.0
-	github.com/google/renameio v1.0.1
 	github.com/kubernetes-csi/csi-test/v5 v5.2.0
 	github.com/onsi/ginkgo/v2 v2.21.0
 	github.com/onsi/gomega v1.34.2

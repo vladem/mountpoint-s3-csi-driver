@@ -69,8 +69,8 @@ spec:
           - --mountpoint-bin-dir=/mountpoint-s3/bin
           - --v={{ $mounter.logLevel }}
         securityContext:
-          runAsUser: 1000
-          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
           capabilities:

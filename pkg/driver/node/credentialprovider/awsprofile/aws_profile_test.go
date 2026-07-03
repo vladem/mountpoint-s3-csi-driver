@@ -5,10 +5,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider/awsprofile"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/driver/node/credentialprovider/awsprofile/awsprofiletest"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util"
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util/testutil/assert"
 )
 
@@ -62,6 +64,25 @@ func TestCreatingAWSProfile(t *testing.T) {
 		credentialsStat, err := os.Stat(filepath.Join(defaultSettings.Basepath, profile.CredentialsFilename))
 		assert.NoError(t, err)
 		assert.Equals(t, testFilePerm, credentialsStat.Mode())
+	})
+
+	t.Run("fails to create files when chown fails", func(t *testing.T) {
+		settings := awsprofile.Settings{
+			Basepath:      t.TempDir(),
+			Prefix:        "test-",
+			FilePerm:      testFilePerm,
+			FileOwnership: &util.FileOwnership{UID: 99999, GID: 99999},
+		}
+		creds := awsprofile.Credentials{
+			AccessKeyID:     testAccessKeyId,
+			SecretAccessKey: testSecretAccessKey,
+			SessionToken:    testSessionToken,
+		}
+		_, err := awsprofile.Create(settings, creds)
+		if err == nil {
+			t.Fatal("expected error because chown requires capabilities which test runner typically doesn't have")
+		}
+		assert.ErrorIs(t, err, syscall.EPERM)
 	})
 
 	t.Run("fail if credentials contains non-ascii characters", func(t *testing.T) {

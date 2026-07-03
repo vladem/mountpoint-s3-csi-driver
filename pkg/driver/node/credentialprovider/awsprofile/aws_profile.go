@@ -10,7 +10,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/google/renameio"
+	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util"
 )
 
 const (
@@ -54,6 +54,8 @@ type Settings struct {
 	Prefix string
 	// FilePerm specifies the file permissions for created profile files
 	FilePerm fs.FileMode
+	// FileOwnership specifies UID/GID for credential files. Nil uses process defaults.
+	FileOwnership *util.FileOwnership
 }
 
 // prefixed prepends the Settings prefix to the given suffix
@@ -82,16 +84,16 @@ func Create(settings Settings, credentials Credentials) (Profile, error) {
 
 	configFilename := settings.prefixed(awsProfileConfigFilenameSuffix)
 	configPath := settings.path(configFilename)
-	err := writeAWSProfileFile(configPath, configFileContents(name), settings.FilePerm)
+	err := writeAWSProfileFile(configPath, configFileContents(name), settings.FilePerm, settings.FileOwnership)
 	if err != nil {
-		return Profile{}, fmt.Errorf("aws-profile: Failed to create config file %s: %v", configPath, err)
+		return Profile{}, fmt.Errorf("aws-profile: Failed to create config file %s: %w", configPath, err)
 	}
 
 	credentialsFilename := settings.prefixed(awsProfileCredentialsFilenameSuffix)
 	credentialsPath := settings.path(credentialsFilename)
-	err = writeAWSProfileFile(credentialsPath, credentialsFileContents(name, credentials), settings.FilePerm)
+	err = writeAWSProfileFile(credentialsPath, credentialsFileContents(name, credentials), settings.FilePerm, settings.FileOwnership)
 	if err != nil {
-		return Profile{}, fmt.Errorf("aws-profile: Failed to create credentials file %s: %v", credentialsPath, err)
+		return Profile{}, fmt.Errorf("aws-profile: Failed to create credentials file %s: %w", credentialsPath, err)
 	}
 
 	return Profile{
@@ -120,9 +122,9 @@ func Cleanup(settings Settings) error {
 	return nil
 }
 
-// writeAWSProfileFile safely writes AWS profile content to a file with given permissions
-func writeAWSProfileFile(path string, content string, filePerm os.FileMode) error {
-	return renameio.WriteFile(path, []byte(content), filePerm)
+// writeAWSProfileFile safely writes AWS profile content to a file with given permissions and ownership.
+func writeAWSProfileFile(path string, content string, filePerm os.FileMode, owner *util.FileOwnership) error {
+	return util.WriteReplaceFile(path, []byte(content), filePerm, owner)
 }
 
 // credentialsFileContents generates the contents for an AWS credentials file

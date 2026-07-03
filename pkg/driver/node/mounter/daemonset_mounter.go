@@ -350,12 +350,19 @@ func (dm *DaemonsetMounter) mountSyscallWithDefault(target string, opts mpmounte
 // provideCredentials creates a per-mount credential directory and provisions credentials into it.
 func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, mountId string, credentialCtx *credentialprovider.ProvideContext) (envprovider.Environment, error) {
 	mountCredDir := filepath.Join(commDir, mountId)
-	if err := os.MkdirAll(mountCredDir, credentialprovider.CredentialDirPerm); err != nil {
+	if err := os.MkdirAll(mountCredDir, credentialprovider.DaemonsetMounterCredentialDirPerm); err != nil {
 		return nil, fmt.Errorf("failed to create credential directory %q: %w", mountCredDir, err)
 	}
+
+	uid := 1001
+	if err := os.Chown(mountCredDir, uid, uid); err != nil {
+		return nil, fmt.Errorf("DaemonsetMounter: failed to chown credentials directory %q: %w", mountCredDir, err)
+	}
+
 	credentialCtx.WritePath = mountCredDir
 	credentialCtx.EnvPath = filepath.Join("/comm", mountId)
 	credentialCtx.MountKind = credentialprovider.MountKindDaemonset
+	credentialCtx.FileOwnership = &util.FileOwnership{UID: uid, GID: uid}
 
 	env, _, err := dm.credProvider.Provide(ctx, *credentialCtx)
 	if err != nil {
