@@ -69,12 +69,17 @@ spec:
           - --mountpoint-bin-dir=/mountpoint-s3/bin
           - --v={{ $mounter.logLevel }}
         securityContext:
-          runAsUser: 1001
-          runAsGroup: 1001
+          runAsUser: 0
+          runAsGroup: 0
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
           capabilities:
-            drop: ["ALL"]
+            drop:
+              - ALL
+            add:
+              - SETUID
+              - SETGID
+              - KILL
           seccompProfile:
             type: RuntimeDefault
         volumeMounts:

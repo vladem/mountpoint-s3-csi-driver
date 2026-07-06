@@ -97,6 +97,7 @@ func TestHandleConnection_PropagatesOptionsToRunner(t *testing.T) {
 			Args:       []string{"--region", "us-west-2"},
 			Env:        []string{"AWS_REGION=us-west-2"},
 			VolumeId:   "pod123-vol456",
+			Uid:        2001,
 		})
 	}()
 
@@ -115,6 +116,15 @@ func TestHandleConnection_PropagatesOptionsToRunner(t *testing.T) {
 	assert.Equals(t, "test-bucket", cmd.Args[1])
 	assert.Equals(t, []string{"AWS_REGION=us-west-2"}, cmd.Env)
 	assert.Equals(t, 1, len(fr.handles[0].extraFds)) // FD was passed
+
+	// Verify UID/GID credentials
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential == nil {
+		t.Fatal("Expected SysProcAttr.Credential to be set")
+	}
+	assert.Equals(t, uint32(2001), cmd.SysProcAttr.Credential.Uid)
+	assert.Equals(t, uint32(2001), cmd.SysProcAttr.Credential.Gid)
+	assert.Equals(t, []uint32{}, cmd.SysProcAttr.Credential.Groups)
+	assert.Equals(t, false, cmd.SysProcAttr.Credential.NoSetGroups)
 
 	// Cleanup
 	fr.handles[0].Exit(0, "")

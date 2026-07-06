@@ -136,7 +136,8 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 	}
 
 	// Provision credentials before the isMounted early return so republish refreshes them
-	credsEnv, err := dm.provideCredentials(ctx, commDir, mountId, &credentialCtx)
+	mountpointUid := dm.allocateUid()
+	credsEnv, err := dm.provideCredentials(ctx, commDir, mountId, &credentialCtx, mountpointUid)
 	if err != nil {
 		return err
 	}
@@ -175,7 +176,7 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 	}
 
 	// Perform FUSE mount and send options to secondary daemonset
-	if err := dm.mountS3AtTarget(ctx, target, bucketName, args, mountId, volumeId, commDir, userEnv, credsEnv); err != nil {
+	if err := dm.mountS3AtTarget(ctx, target, bucketName, args, mountId, volumeId, commDir, userEnv, credsEnv, mountpointUid); err != nil {
 		return err
 	}
 
@@ -242,7 +243,7 @@ func (dm *DaemonsetMounter) IsMountPoint(target string) (bool, error) {
 // at target; on failure any partial mount is cleaned up.
 func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, bucketName string,
 	args mountpoint.Args, mountId string, volumeId string, commDir string,
-	userEnv envprovider.Environment, credsEnv envprovider.Environment) error {
+	userEnv envprovider.Environment, credsEnv envprovider.Environment, mountpointUid uint32) error {
 
 	mountOpts := mpmounter.MountOptions{
 		ReadOnly:   args.Has(mountpoint.ArgReadOnly),
@@ -284,6 +285,7 @@ func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, 
 		Args:       args.SortedList(),
 		Env:        env.List(),
 		VolumeId:   mountId,
+		Uid:        mountpointUid,
 	})
 	if err != nil {
 		// If send failed due to stale path, signal re-discovery and let Kubelet retry NodePublishVolume.
@@ -348,21 +350,20 @@ func (dm *DaemonsetMounter) mountSyscallWithDefault(target string, opts mpmounte
 }
 
 // provideCredentials creates a per-mount credential directory and provisions credentials into it.
-func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, mountId string, credentialCtx *credentialprovider.ProvideContext) (envprovider.Environment, error) {
+func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, mountId string, credentialCtx *credentialprovider.ProvideContext, mountpointUid uint32) (envprovider.Environment, error) {
 	mountCredDir := filepath.Join(commDir, mountId)
 	if err := os.MkdirAll(mountCredDir, credentialprovider.DaemonsetMounterCredentialDirPerm); err != nil {
 		return nil, fmt.Errorf("failed to create credential directory %q: %w", mountCredDir, err)
 	}
 
-	uid := 1001
-	if err := os.Chown(mountCredDir, uid, uid); err != nil {
+	if err := os.Chown(mountCredDir, int(mountpointUid), int(mountpointUid)); err != nil {
 		return nil, fmt.Errorf("DaemonsetMounter: failed to chown credentials directory %q: %w", mountCredDir, err)
 	}
 
 	credentialCtx.WritePath = mountCredDir
 	credentialCtx.EnvPath = filepath.Join("/comm", mountId)
 	credentialCtx.MountKind = credentialprovider.MountKindDaemonset
-	credentialCtx.FileOwnership = &util.FileOwnership{UID: uid, GID: uid}
+	credentialCtx.FileOwnership = &util.FileOwnership{UID: int(mountpointUid), GID: int(mountpointUid)}
 
 	env, _, err := dm.credProvider.Provide(ctx, *credentialCtx)
 	if err != nil {
@@ -540,4 +541,8 @@ func (dm *DaemonsetMounter) tryDiscoverCommDir(ctx context.Context) (string, err
 	commDir := filepath.Join(dm.kubeletPath, "pods", podUID, "volumes", "kubernetes.io~empty-dir", CommVolumeName)
 	klog.V(4).Infof("DaemonsetMounter: discovered mounter pod %s (uid=%s), comm dir: %s", running[0].Name, podUID, commDir)
 	return commDir, nil
+}
+
+func (dm *DaemonsetMounter) allocateUid() uint32 {
+	return 1001
 }
