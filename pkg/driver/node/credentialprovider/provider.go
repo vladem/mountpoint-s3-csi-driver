@@ -223,6 +223,17 @@ func (c *Provider) Provide(ctx context.Context, provideCtx ProvideContext) (envp
 		return nil, "", fmt.Errorf("MountKind must be specified on credential ProvideContext struct.")
 	}
 
+	if provideCtx.MountKind == MountKindDaemonset {
+		if err := os.Mkdir(provideCtx.WritePath, DaemonsetMounterCredentialDirPerm); err != nil && !errors.Is(err, fs.ErrExist) {
+			return nil, "", fmt.Errorf("failed to create credential directory %q: %w", provideCtx.WritePath, err)
+		}
+		if provideCtx.FileOwnership != nil {
+			if err := os.Chown(provideCtx.WritePath, provideCtx.FileOwnership.UID, provideCtx.FileOwnership.GID); err != nil {
+				return nil, "", fmt.Errorf("failed to chown credential directory %q: %w", provideCtx.WritePath, err)
+			}
+		}
+	}
+
 	authenticationSource := provideCtx.AuthenticationSource
 	switch authenticationSource {
 	case AuthenticationSourcePod:
@@ -237,6 +248,7 @@ func (c *Provider) Provide(ctx context.Context, provideCtx ProvideContext) (envp
 }
 
 // Cleanup cleans any previously created credential files for given context.
+// For the daemonset mode it also removes the directory.
 func (c *Provider) Cleanup(cleanupCtx CleanupContext) error {
 	if cleanupCtx.MountKind == MountKindUnspecified {
 		return fmt.Errorf("MountKind must be specified on credential CleanupContext struct.")
@@ -244,6 +256,13 @@ func (c *Provider) Cleanup(cleanupCtx CleanupContext) error {
 
 	errPod := c.cleanupFromPod(cleanupCtx)
 	errDriver := c.cleanupFromDriver(cleanupCtx)
+
+	if cleanupCtx.MountKind == MountKindDaemonset {
+		if err := os.RemoveAll(cleanupCtx.WritePath); err != nil {
+			return errors.Join(errPod, errDriver, err)
+		}
+	}
+
 	return errors.Join(errPod, errDriver)
 }
 

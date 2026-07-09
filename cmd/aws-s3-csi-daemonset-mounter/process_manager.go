@@ -60,13 +60,15 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	cmd := exec.Command(mountpointPath, cmdArgs...)
 	cmd.ExtraFiles = []*os.File{fuseDev}
 
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{
-			Uid:         options.Uid,
-			Gid:         options.Uid,
-			Groups:      []uint32{},
-			NoSetGroups: false, // clears all supplementary groups
-		},
+	if options.Credential != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{
+				Uid:         options.Credential.Uid,
+				Gid:         options.Credential.Gid,
+				Groups:      []uint32{},
+				NoSetGroups: false,
+			},
+		}
 	}
 
 	// TODO: we might need to make the child to inherit credentials ENV from this process (for driver-level creds)

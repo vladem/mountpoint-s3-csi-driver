@@ -97,7 +97,7 @@ func TestHandleConnection_PropagatesOptionsToRunner(t *testing.T) {
 			Args:       []string{"--region", "us-west-2"},
 			Env:        []string{"AWS_REGION=us-west-2"},
 			VolumeId:   "pod123-vol456",
-			Uid:        2001,
+			Credential: &mountoptions.ProcessCredential{Uid: 2001, Gid: 2001},
 		})
 	}()
 

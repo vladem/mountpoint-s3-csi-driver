@@ -31,6 +31,15 @@ import (
 	"github.com/awslabs/mountpoint-s3-csi-driver/pkg/util/testutil/assert"
 )
 
+const fakeAllocatedUid = uint32(3000)
+
+type fakeUidAllocator struct {
+	released []uint32
+}
+
+func (a *fakeUidAllocator) Allocate() (uint32, error) { return fakeAllocatedUid, nil }
+func (a *fakeUidAllocator) Release(uid uint32)        { a.released = append(a.released, uid) }
+
 type dmTestCtx struct {
 	t   *testing.T
 	ctx context.Context
@@ -139,7 +148,7 @@ func setupDM(t *testing.T, credProvider ...credentialprovider.ProviderInterface)
 		cp = mockCP
 	}
 
-	dm := mounter.NewDaemonsetMounter(client, nodeName, mpmounter.NewWithMount(fakeMounter), cp, mountSyscall)
+	dm := mounter.NewDaemonsetMounter(client, nodeName, mpmounter.NewWithMount(fakeMounter), cp, &fakeUidAllocator{}, mountSyscall)
 	err = dm.DiscoverCommDir(ctx)
 	assert.NoError(t, err)
 
@@ -195,6 +204,7 @@ func TestDaemonsetMounter(t *testing.T) {
 				Args:       []string{"--prefix=data/"},
 				Env:        env.List(),
 				VolumeId:   mustGetMountId(t, testCtx.targetPath),
+				Credential: &mountoptions.ProcessCredential{Uid: fakeAllocatedUid, Gid: fakeAllocatedUid},
 			}, got)
 		})
 
@@ -306,14 +316,19 @@ func TestDaemonsetMounter(t *testing.T) {
 			target := testCtx.targetPath
 			mountId := mustGetMountId(t, target)
 
-			expectedWritePath := filepath.Join(testCtx.commDir, mountId)
-			expectedEnvPath := filepath.Join("/comm", mountId)
+			expectedWritePath := filepath.Join(testCtx.commDir, mounter.GetCredentialDirName(mountId))
+			expectedEnvPath := filepath.Join("/comm", mounter.GetCredentialDirName(mountId))
 
 			provideCall := mockCredProvider.EXPECT().Provide(gomock.Any(), gomock.Any()).
 				DoAndReturn(func(_ context.Context, provideCtx credentialprovider.ProvideContext) (envprovider.Environment, credentialprovider.AuthenticationSource, error) {
 					assert.Equals(t, expectedWritePath, provideCtx.WritePath)
 					assert.Equals(t, expectedEnvPath, provideCtx.EnvPath)
 					assert.Equals(t, credentialprovider.MountKindDaemonset, provideCtx.MountKind)
+					if provideCtx.FileOwnership == nil {
+						t.Fatal("Expected FileOwnership to be set")
+					}
+					assert.Equals(t, int(fakeAllocatedUid), provideCtx.FileOwnership.UID)
+					assert.Equals(t, int(fakeAllocatedUid), provideCtx.FileOwnership.GID)
 					return envprovider.Environment{}, credentialprovider.AuthenticationSourceDriver, nil
 				})
 
@@ -405,7 +420,7 @@ func TestDaemonsetMounter(t *testing.T) {
 					t.Setenv("CONTAINER_KUBELET_PATH", t.TempDir())
 
 					client := fake.NewSimpleClientset(tt.pods...)
-					dm := mounter.NewDaemonsetMounter(client, "test-node", mpmounter.NewWithMount(mount.NewFakeMounter(nil)), nil, nil)
+					dm := mounter.NewDaemonsetMounter(client, "test-node", mpmounter.NewWithMount(mount.NewFakeMounter(nil)), nil, &fakeUidAllocator{}, nil)
 
 					ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 					defer cancel()
@@ -451,6 +466,7 @@ func TestDaemonsetMounter(t *testing.T) {
 				testCtx.client, testCtx.nodeName,
 				mpmounter.NewWithMount(testCtx.mount),
 				nil,
+				&fakeUidAllocator{},
 				func(target string, opts mpmounter.MountOptions) (int, error) {
 					mountSyscallCalled = true
 					return 0, nil

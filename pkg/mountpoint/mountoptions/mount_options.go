@@ -29,10 +29,15 @@ type Options struct {
 	// tracking and error file naming. In daemonset mode this is "<podUID>-<volumeId>".
 	// With pod sharing it'll be "volumeID" (PersistentVolume: metadata.name).
 	VolumeId string `json:"volumeId,omitempty"`
-	// Uid is the UID (and GID) to run the Mountpoint child process as.
-	// The daemonset mounter parent process runs as root and drops to this UID/GID
-	// before exec'ing the child, clearing all supplementary groups.
-	Uid uint32 `json:"uid,omitempty"`
+	// Credential specifies the UID/GID to run the Mountpoint child process as.
+	// When nil, the child inherits the parent's credentials (no isolation).
+	Credential *ProcessCredential `json:"credential,omitempty"`
+}
+
+// ProcessCredential specifies UID and GID for a child process.
+type ProcessCredential struct {
+	Uid uint32 `json:"uid"`
+	Gid uint32 `json:"gid"`
 }
 
 // Send sends given mount `options` to given `sockPath` to be received by `Recv` function on the other end.

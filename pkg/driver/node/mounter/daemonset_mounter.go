@@ -88,6 +88,8 @@ type DaemonsetMounter struct {
 	kubeletPath  string
 	mount        *mpmounter.Mounter
 	credProvider credentialprovider.ProviderInterface
+	uidAllocator UidAllocatorInterface
+	registry     *MountRegistry
 
 	// Comm dir discovery: commDir caches the path (nil = stale),
 	// rediscoverCh wakes the background watcher to re-discover immediately.
@@ -101,13 +103,15 @@ type DaemonsetMounter struct {
 // NewDaemonsetMounter creates a new [DaemonsetMounter].
 // mountSyscall may be nil, in which case the default FUSE mount implementation is used.
 func NewDaemonsetMounter(clientset kubernetes.Interface, nodeID string, mount *mpmounter.Mounter,
-	credProvider credentialprovider.ProviderInterface, mountSyscall mountSyscallFunc) *DaemonsetMounter {
+	credProvider credentialprovider.ProviderInterface, uidAllocator UidAllocatorInterface, mountSyscall mountSyscallFunc) *DaemonsetMounter {
 	return &DaemonsetMounter{
 		clientset:    clientset,
 		nodeID:       nodeID,
 		kubeletPath:  util.ContainerKubeletPath(),
 		mount:        mount,
 		credProvider: credProvider,
+		uidAllocator: uidAllocator,
+		registry:     NewMountRegistry(),
 		rediscoverCh: make(chan struct{}, 1),
 		mountSyscall: mountSyscall,
 	}
@@ -135,9 +139,19 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 		return fmt.Errorf("failed to find s3-csi-daemonset-mounter pod: %w. %s", err, helpMessageForCheckingMounterPodStatus())
 	}
 
-	// Provision credentials before the isMounted early return so republish refreshes them
-	mountpointUid := dm.allocateUid()
-	credsEnv, err := dm.provideCredentials(ctx, commDir, mountId, &credentialCtx, mountpointUid)
+	// Reuse previously assigned UID for this mount, or allocate a new one
+	var uid uint32
+	if rec := dm.registry.Get(mountId); rec != nil {
+		uid = rec.Uid
+	} else {
+		uid, err = dm.uidAllocator.Allocate()
+		if err != nil {
+			return fmt.Errorf("failed to allocate UID for mount %s: %w", mountId, err)
+		}
+		dm.registry.Create(mountId, &MountRecord{Uid: uid, CommDir: commDir, Target: target, CreatedAt: time.Now()})
+	}
+	processCred := &mountoptions.ProcessCredential{Uid: uid, Gid: uid}
+	credsEnv, err := dm.provideCredentials(ctx, commDir, mountId, &credentialCtx, processCred)
 	if err != nil {
 		return err
 	}
@@ -146,9 +160,12 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 			return
 		}
 		if err := dm.cleanupCredentials(commDir, mountId, credentialCtx.ToCleanupCtx()); err != nil {
+			// Leave UID allocated and registry entry in place; periodic cleanup will retry.
 			klog.Errorf("DaemonsetMounter: failed to clean up credential directory for mount %s: %v", mountId, err)
-			// TODO(vlaad): once we have UID allocation, we shouldn't return UID to the pool here, we need to cleanup creds first
+			return
 		}
+		dm.uidAllocator.Release(uid)
+		dm.registry.Delete(mountId)
 	}()
 
 	// Idempotency: if target is already a healthy Mountpoint mount, return early
@@ -176,7 +193,7 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 	}
 
 	// Perform FUSE mount and send options to secondary daemonset
-	if err := dm.mountS3AtTarget(ctx, target, bucketName, args, mountId, volumeId, commDir, userEnv, credsEnv, mountpointUid); err != nil {
+	if err := dm.mountS3AtTarget(ctx, target, bucketName, args, mountId, volumeId, commDir, userEnv, credsEnv, processCred); err != nil {
 		return err
 	}
 
@@ -204,30 +221,36 @@ func (dm *DaemonsetMounter) Mount(ctx context.Context, bucketName string, target
 // Unmount unmounts the FUSE filesystem at target.
 // This causes the Mountpoint process in the secondary daemonset to exit.
 func (dm *DaemonsetMounter) Unmount(ctx context.Context, target string, cleanupCtx credentialprovider.CleanupContext) error {
-	// cleanup the error file and credentials
-	commDir, err := dm.GetCommDir()
-	if err != nil {
-		return fmt.Errorf("failed to find s3-csi-daemonset-mounter pod: %w. %s", err, helpMessageForCheckingMounterPodStatus())
-	}
 	mountId, err := GetMountId(target)
 	if err != nil {
 		return err
 	}
 
-	if err = removeIfExists(filepath.Join(commDir, GetErrorFileName(mountId))); err != nil {
-		return fmt.Errorf("failed to remove the error file: %w", err)
-	}
-
-	err = dm.cleanupCredentials(commDir, mountId, cleanupCtx)
-	if err != nil {
-		return fmt.Errorf("failed to cleanup credentials: %w", err)
-	}
-
-	// finally unmount (this order ensures retrying cleanup)
 	err = dm.mount.Unmount(target)
 	if err != nil {
 		return fmt.Errorf("failed to unmount %q: %w", target, err)
 	}
+
+	rec := dm.registry.Get(mountId)
+	if rec == nil {
+		return nil
+	}
+
+	// Use commDir from registry to ensure cleanup targets the same directory where
+	// resources were created, even if commDir was re-discovered since mount time.
+	if err = removeIfExists(filepath.Join(rec.CommDir, GetErrorFileName(mountId))); err != nil {
+		return fmt.Errorf("failed to remove the error file: %w", err)
+	}
+
+	err = dm.cleanupCredentials(rec.CommDir, mountId, cleanupCtx)
+	if err != nil {
+		// Keep UID allocated and registry entry; periodic cleanup will retry.
+		return fmt.Errorf("failed to cleanup credentials: %w", err)
+	}
+
+	// Only release UID and forget mount once credentials are fully removed.
+	dm.uidAllocator.Release(rec.Uid)
+	dm.registry.Delete(mountId)
 
 	klog.V(4).Infof("DaemonsetMounter: volume %s unmounted from %s", cleanupCtx.VolumeID, target)
 	return nil
@@ -238,12 +261,50 @@ func (dm *DaemonsetMounter) IsMountPoint(target string) (bool, error) {
 	return dm.mount.CheckMountpoint(target)
 }
 
+const staleCleanupInterval = 10 * time.Second
+
+// StartStaleMountCleanup runs a background loop that periodically cleans up stale mount
+// records (older than 10min with no active mount on target).
+func (dm *DaemonsetMounter) StartStaleMountCleanup(stopCh <-chan struct{}) {
+	ticker := time.NewTicker(staleCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			dm.cleanupStaleMounts()
+		}
+	}
+}
+
+func (dm *DaemonsetMounter) cleanupStaleMounts() {
+	staleIds := dm.registry.StaleMounts(dm.IsMountPoint)
+	for _, mountId := range staleIds {
+		rec := dm.registry.Get(mountId)
+		if rec == nil {
+			continue
+		}
+		cleanupCtx := credentialprovider.CleanupContext{
+			WritePath: filepath.Join(rec.CommDir, GetCredentialDirName(mountId)),
+			MountKind: credentialprovider.MountKindDaemonset,
+		}
+		if err := dm.credProvider.Cleanup(cleanupCtx); err != nil {
+			klog.Warningf("DaemonsetMounter: stale cleanup failed for mount %s: %v", mountId, err)
+			continue
+		}
+		dm.uidAllocator.Release(rec.Uid)
+		dm.registry.Delete(mountId)
+		klog.V(4).Infof("DaemonsetMounter: cleaned up stale mount %s", mountId)
+	}
+}
+
 // mountS3AtTarget performs the kernel FUSE mount at target and sends mount options
 // (including the FUSE fd) to the secondary daemonset. On success the mount remains
 // at target; on failure any partial mount is cleaned up.
 func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, bucketName string,
 	args mountpoint.Args, mountId string, volumeId string, commDir string,
-	userEnv envprovider.Environment, credsEnv envprovider.Environment, mountpointUid uint32) error {
+	userEnv envprovider.Environment, credsEnv envprovider.Environment, cred *mountoptions.ProcessCredential) error {
 
 	mountOpts := mpmounter.MountOptions{
 		ReadOnly:   args.Has(mountpoint.ArgReadOnly),
@@ -285,7 +346,7 @@ func (dm *DaemonsetMounter) mountS3AtTarget(ctx context.Context, target string, 
 		Args:       args.SortedList(),
 		Env:        env.List(),
 		VolumeId:   mountId,
-		Uid:        mountpointUid,
+		Credential: cred,
 	})
 	if err != nil {
 		// If send failed due to stale path, signal re-discovery and let Kubelet retry NodePublishVolume.
@@ -349,21 +410,14 @@ func (dm *DaemonsetMounter) mountSyscallWithDefault(target string, opts mpmounte
 	return dm.mount.Mount(target, opts)
 }
 
-// provideCredentials creates a per-mount credential directory and provisions credentials into it.
-func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, mountId string, credentialCtx *credentialprovider.ProvideContext, mountpointUid uint32) (envprovider.Environment, error) {
-	mountCredDir := filepath.Join(commDir, mountId)
-	if err := os.MkdirAll(mountCredDir, credentialprovider.DaemonsetMounterCredentialDirPerm); err != nil {
-		return nil, fmt.Errorf("failed to create credential directory %q: %w", mountCredDir, err)
-	}
-
-	if err := os.Chown(mountCredDir, int(mountpointUid), int(mountpointUid)); err != nil {
-		return nil, fmt.Errorf("DaemonsetMounter: failed to chown credentials directory %q: %w", mountCredDir, err)
-	}
-
-	credentialCtx.WritePath = mountCredDir
-	credentialCtx.EnvPath = filepath.Join("/comm", mountId)
+// provideCredentials provisions credentials for a mount into the comm directory.
+func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, mountId string, credentialCtx *credentialprovider.ProvideContext, cred *mountoptions.ProcessCredential) (envprovider.Environment, error) {
+	credentialCtx.WritePath = filepath.Join(commDir, GetCredentialDirName(mountId))
+	credentialCtx.EnvPath = filepath.Join("/comm", GetCredentialDirName(mountId))
 	credentialCtx.MountKind = credentialprovider.MountKindDaemonset
-	credentialCtx.FileOwnership = &util.FileOwnership{UID: int(mountpointUid), GID: int(mountpointUid)}
+	if cred != nil {
+		credentialCtx.FileOwnership = &util.FileOwnership{UID: int(cred.Uid), GID: int(cred.Gid)}
+	}
 
 	env, _, err := dm.credProvider.Provide(ctx, *credentialCtx)
 	if err != nil {
@@ -374,13 +428,9 @@ func (dm *DaemonsetMounter) provideCredentials(ctx context.Context, commDir, mou
 
 // cleanupCredentials removes the per-mount credential directory.
 func (dm *DaemonsetMounter) cleanupCredentials(commDir, mountId string, cleanupCtx credentialprovider.CleanupContext) error {
-	mountCredDir := filepath.Join(commDir, mountId)
-	cleanupCtx.WritePath = mountCredDir
+	cleanupCtx.WritePath = filepath.Join(commDir, GetCredentialDirName(mountId))
 	cleanupCtx.MountKind = credentialprovider.MountKindDaemonset
 	if err := dm.credProvider.Cleanup(cleanupCtx); err != nil {
-		return err
-	}
-	if err := os.RemoveAll(mountCredDir); err != nil {
 		return err
 	}
 	return nil
@@ -398,6 +448,10 @@ func GetMountId(target string) (string, error) {
 		return "", fmt.Errorf("failed to parse target path %q: %w", target, err)
 	}
 	return k8sstrings.EscapeQualifiedName(tp.PodID) + "-" + k8sstrings.EscapeQualifiedName(tp.VolumeID), nil
+}
+
+func GetCredentialDirName(mountId string) string {
+	return "credentials-" + mountId
 }
 
 // GetErrorFileName returns the error file name for a given mount ID.
@@ -541,8 +595,4 @@ func (dm *DaemonsetMounter) tryDiscoverCommDir(ctx context.Context) (string, err
 	commDir := filepath.Join(dm.kubeletPath, "pods", podUID, "volumes", "kubernetes.io~empty-dir", CommVolumeName)
 	klog.V(4).Infof("DaemonsetMounter: discovered mounter pod %s (uid=%s), comm dir: %s", running[0].Name, podUID, commDir)
 	return commDir, nil
-}
-
-func (dm *DaemonsetMounter) allocateUid() uint32 {
-	return 1001
 }
