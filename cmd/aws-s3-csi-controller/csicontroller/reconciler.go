@@ -262,8 +262,13 @@ func (r *Reconciler) getWorkloadVolumes(
 		// If PVC has no bound PVs yet, `getBoundPVForPodClaim` will return `errPVCIsNotBoundToAPV`.
 		// In this case we'll just return `reconcile.Result{Requeue: true}` here, which will bubble up to the
 		// original `Reconcile` call and will cause a retry for this Pod with an exponential backoff.
-		pvc, pv, err := r.getBoundPVForPodClaim(ctx, workloadPod, podPVC)
+		// If PVC is not backed by S3 driver, we ignore it, even if it's unbound.
+		volume, err := r.getBoundS3PVForPodClaim(ctx, workloadPod, podPVC)
 		if err != nil {
+			// Ignore non-S3 PVC-s
+			if errors.Is(err, errPVCIsNotS3) {
+				continue
+			}
 			if errors.Is(err, errPVCIsNotBoundToAPV) {
 				status = Requeue
 			} else {
@@ -272,12 +277,7 @@ func (r *Reconciler) getWorkloadVolumes(
 			continue
 		}
 
-		csiSpec := extractCSISpecFromPV(pv)
-		if csiSpec == nil {
-			continue
-		}
-
-		volumes = append(volumes, &workloadVolume{pv, pvc, csiSpec})
+		volumes = append(volumes, volume)
 	}
 
 	return volumes, status, errors.Join(errs...)
@@ -879,43 +879,62 @@ func (r *Reconciler) shouldAssignNewWorkloadToMountpointPod(mpPod *corev1.Pod, l
 // This is not a terminal error - as PVCs can be bound to PVs dynamically - and just a transient error
 // to be retried later.
 var errPVCIsNotBoundToAPV = errors.New("PVC is not bound to a PV yet")
+var errPVCIsNotS3 = errors.New("not an S3 PVC")
 
-// getBoundPVForPodClaim tries to find bound PV and PVC from given `claim`.
+// getBoundS3PVForPodClaim tries to find bound PV and PVC from given `claim`.
 // It `errPVCIsNotBoundToAPV` if PVC is not bound to a PV yet to be eventually retried.
-func (r *Reconciler) getBoundPVForPodClaim(
+// It `errPVCIsNotS3` if PVC is not guaranteed not backed by our driver, we skip such PVC-s.
+func (r *Reconciler) getBoundS3PVForPodClaim(
 	ctx context.Context,
 	pod *corev1.Pod,
 	claim *corev1.PersistentVolumeClaimVolumeSource,
-) (*corev1.PersistentVolumeClaim, *corev1.PersistentVolume, error) {
+) (*workloadVolume, error) {
 	log := logf.FromContext(ctx).WithValues("pod", types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, "pvc", claim.ClaimName)
 
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: claim.ClaimName}, pvc)
 	if err != nil {
 		log.Error(err, "Failed to get PVC for Pod")
-		return nil, nil, fmt.Errorf("Failed to get PVC for Pod: %w", err)
+		return nil, fmt.Errorf("Failed to get PVC for Pod: %w", err)
 	}
 
-	if pvc.Status.Phase != corev1.ClaimBound || pvc.Spec.VolumeName == "" {
-		log.V(debugLevel).Info("PVC is not bound to a PV yet or has a empty volume name - ignoring",
-			"status", pvc.Status.Phase,
-			"volumeName", pvc.Spec.VolumeName)
-		return nil, nil, errPVCIsNotBoundToAPV
+	// S3 CSI Driver doesn't support dynamic provisioning, so the claim has to reference a PV
+	// TODO: support dynamic provisioning
+	if pvc.Spec.VolumeName == "" {
+		return nil, errPVCIsNotS3
 	}
 
 	pv := &corev1.PersistentVolume{}
 	err = r.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName}, pv)
 	if err != nil {
 		log.Error(err, "Failed to get PV bound to PVC", "volumeName", pvc.Spec.VolumeName)
-		return nil, nil, fmt.Errorf("Failed to get PV bound to PVC: %w", err)
+		return nil, fmt.Errorf("Failed to get PV bound to PVC: %w", err)
+	}
+
+	// PV-s of S3 CSI Driver must reference it in CSI section
+	csi := extractCSISpecFromPV(pv)
+	if csi == nil {
+		return nil, errPVCIsNotS3
+	}
+
+	// We wait for binding only for S3 PV-s
+	if pvc.Status.Phase != corev1.ClaimBound {
+		log.V(debugLevel).Info("PVC is not bound to a PV yet - ignoring",
+			"status", pvc.Status.Phase,
+			"volumeName", pvc.Spec.VolumeName)
+		return nil, errPVCIsNotBoundToAPV
 	}
 
 	if pv.Spec.ClaimRef == nil || pv.Spec.ClaimRef.Name != pvc.Name {
 		log.Info("Found the PV but its `ClaimRef` is not bound to the PVC", "volumeName", pvc.Spec.VolumeName)
-		return nil, nil, errors.New("The PV has a different `ClaimRef` than the PVC")
+		return nil, errors.New("The PV has a different `ClaimRef` than the PVC")
 	}
 
-	return pvc, pv, nil
+	return &workloadVolume{
+		pv:      pv,
+		pvc:     pvc,
+		csiSpec: csi,
+	}, nil
 }
 
 // findIRSAServiceAccountRole retrieves the IAM role ARN associated with a pod's service account
